@@ -7,14 +7,17 @@ export default function App() {
     id: 'M-01',
     sectionType: 'Plates',
     connection: 'Bolted',
+    alloy: 'Generic/Unspecified',
     width: 100,
     thickness: 10,
     dia: 16,
     ag: 1000,
     holeDia: 18,
     noOfHoles: 2,
+    rows: 2,
     s: 50,
     g: 50,
+    e: 30,
     an: 820,
     beta: 1.0,
     rho: 1.0,
@@ -26,7 +29,7 @@ export default function App() {
   });
 
   const [results, setResults] = useState({
-    is8147: { yield: 0, rupture: 0, blockShear: 0, final: 0, mode: '' },
+    is8147: { yield: 0, rupture: 0, blockShear: 0, final: 0, mode: '', sigma_at: 0, alloyName: '', isFyConflict: false },
     eurocode: { yield: 0, rupture: 0, blockShear: 0, final: 0, mode: '' },
   });
 
@@ -38,7 +41,7 @@ export default function App() {
       setInputs((prev) => ({ ...prev, [name]: checked }));
     } else {
       setInputs((prev) => {
-        const parsedValue = ['id', 'sectionType', 'connection'].includes(name) ? value : Number(value);
+        const parsedValue = ['id', 'sectionType', 'connection', 'alloy'].includes(name) ? value : Number(value);
         const newInputs = { ...prev, [name]: parsedValue };
 
         if (name === 'sectionType') {
@@ -61,95 +64,99 @@ export default function App() {
   };
 
   useEffect(() => {
-    // Auto-calculate Beta and Rho based on Eurocode principles (simplified)
+    // Auto-calculate Beta and Rho based on Eurocode principles
     let calculatedBeta = 1.0;
     let calculatedRho = 1.0;
 
-    if (inputs.sectionType === 'Single Angles' || inputs.sectionType === 'Double Angles') {
-      // Simplified adaptive beta for outstanding legs
+    if (['Single Angles', 'Double Angles', 'Channels'].includes(inputs.sectionType)) {
       calculatedBeta = Math.max(0.6, Math.min(1.0, 1.2 - 0.005 * inputs.width)); 
     }
 
-    if (inputs.connection === 'Welded' && inputs.includeHaz) {
-      // Continuous gradient profile for HAZ (simplified)
+    if (inputs.connection === 'Welded' && inputs.includeHaz && inputs.sectionType !== 'Hollow Sections') {
       calculatedRho = inputs.hazFactor;
+    }
+
+    // Area Corrections (Mandatory)
+    const calculatedHoleDia = inputs.dia + 2;
+    const calculatedAg = inputs.width * inputs.thickness;
+    
+    // Staggered Net Area (An)
+    const staggerTerm = (inputs.s > 0 && inputs.g > 0) ? (inputs.s * inputs.s) / (4 * inputs.g) : 0;
+    const calculatedAn = (inputs.width - (inputs.noOfHoles * calculatedHoleDia) + staggerTerm) * inputs.thickness;
+
+    // Effective Area (Aeff)
+    let calculatedAeff = calculatedAn;
+    if (['Single Angles', 'Double Angles', 'Channels'].includes(inputs.sectionType)) {
+      calculatedAeff = calculatedBeta * calculatedAn;
+    } else if (inputs.connection === 'Welded' && inputs.includeHaz) {
+      calculatedAeff = calculatedRho * calculatedAg;
     }
 
     setInputs((prev) => ({
       ...prev,
       beta: parseFloat(calculatedBeta.toFixed(2)),
       rho: parseFloat(calculatedRho.toFixed(2)),
+      holeDia: calculatedHoleDia,
+      ag: parseFloat(calculatedAg.toFixed(2)),
+      an: parseFloat(calculatedAn.toFixed(2)),
+      aeff: parseFloat(calculatedAeff.toFixed(2)),
     }));
-  }, [inputs.sectionType, inputs.connection, inputs.width, inputs.includeHaz, inputs.hazFactor]);
+  }, [inputs.sectionType, inputs.connection, inputs.width, inputs.thickness, inputs.dia, inputs.noOfHoles, inputs.s, inputs.g, inputs.includeHaz, inputs.hazFactor]);
 
   useEffect(() => {
     calculateResults();
   }, [inputs]);
 
   const calculateResults = () => {
-    const { ag, an, fy, fu, connection, s, g, thickness, noOfHoles, holeDia, beta, rho, includeHaz } = inputs;
+    const { ag, an, aeff, fy, fu, connection, s, g, e, thickness, rows, holeDia, rho, includeHaz, alloy } = inputs;
 
-    // Calculate effective area based on Beta and Rho
-    let calculatedAeff = an;
-    if (connection === 'Welded') {
-      calculatedAeff = ag * rho; // HAZ affects gross area in welded connections
-    } else if (['Single Angles', 'Double Angles'].includes(inputs.sectionType)) {
-      calculatedAeff = an * beta; // Shear lag affects net area in bolted angles
-    }
-    
-    // Update Aeff in state if it changed
-    if (calculatedAeff !== inputs.aeff) {
-      setInputs(prev => ({ ...prev, aeff: parseFloat(calculatedAeff.toFixed(2)) }));
-    }
+    // HAZ Property Reduction
+    const fy_calc = (includeHaz && connection === 'Welded') ? fy * rho : fy;
+    const fu_calc = (includeHaz && connection === 'Welded') ? fu * rho : fu;
 
-    // IS 8147:1976 Calculations
-    const pt = 0.6 * fy;
-    
-    // Yielding of Gross Section
-    const is_yield = (ag * pt) / 1000; 
-    
-    // Rupture of Net Section
-    let is_rupture = (an * pt) / 1000;
-    
-    // IS 8147 HAZ consideration (crude 25mm step-function approximation)
-    if (connection === 'Welded' && includeHaz) {
-       // Simplified representation of IS 8147 HAZ reduction
-       is_rupture = is_rupture * 0.85; 
-    }
-    
-    // Block Shear (Not specified in IS 8147)
+    // Alloy Mapping for IS 8147
+    let sigma_at = 105;
+    let alloyName = 'HE30-WP (6061-T6)';
+    if (alloy === 'HE20-WP (6082-T6)') { sigma_at = 115; alloyName = alloy; }
+    else if (alloy === 'HE9-WP (6063-T6)') { sigma_at = 85; alloyName = alloy; }
+    else if (alloy === 'HE15-WP (2014-T6)') { sigma_at = 175; alloyName = alloy; }
+    else if (alloy === 'HE30-WP (6061-T6)') { sigma_at = 105; alloyName = alloy; }
+    else { sigma_at = 105; alloyName = 'Generic/Unspecified (Defaulting to HE30-WP)'; }
+
+    const isFyConflict = Math.abs(0.6 * fy - sigma_at) > 1;
+
+    // IS 8147:1976 Calculations (Working Stress Design)
+    const sigma_at_calc = (includeHaz && connection === 'Welded') ? sigma_at * rho : sigma_at;
+
+    const is_yield = (sigma_at_calc * ag) / 1000;
+    const is_rupture = (Math.min(1.2 * sigma_at_calc, 0.5 * fu_calc) * an) / 1000;
     const is_blockShear = 0; 
     
     const is_final = Math.min(is_yield, is_rupture);
     const is_mode = is_yield < is_rupture ? 'Yielding' : 'Rupture';
 
-    // Eurocode EN 1999 Calculations
+    // Eurocode EN 1999 Calculations (Limit State Design)
     const gammaM0 = 1.1;
     const gammaM2 = 1.25;
 
     // Yielding
-    let ec_yield = (ag * fy) / gammaM0 / 1000;
-    
-    // Eurocode HAZ consideration for Yielding
-    if (connection === 'Welded' && includeHaz) {
-      // Reduced effective thickness approach
-      ec_yield = (ag * rho * fy) / gammaM0 / 1000;
-    }
+    const ec_yield = (ag * fy_calc) / gammaM0 / 1000;
 
     // Rupture
-    let ec_rupture = 0;
-    if (connection === 'Welded') {
-      ec_rupture = (0.9 * calculatedAeff * fu) / gammaM2 / 1000;
-    } else {
-      ec_rupture = (0.9 * calculatedAeff * fu) / gammaM2 / 1000;
-    }
+    const ec_rupture = (0.9 * aeff * fu_calc) / gammaM2 / 1000;
 
     // Block Shear
     let ec_blockShear = 0;
-    if (connection === 'Bolted' && s > 0 && noOfHoles > 1) {
-      const avg = Math.max(0, (noOfHoles - 1) * s * thickness);
-      const atn = Math.max(0, g * thickness - 0.5 * holeDia * thickness);
-      ec_blockShear = ((fu / Math.sqrt(3)) * avg / gammaM2 + (fy * atn) / gammaM0) / 1000;
+    if (connection === 'Bolted' && s > 0 && rows > 0) {
+      const anv = Math.max(0, ((rows - 1) * s + e - (rows - 0.5) * holeDia) * thickness);
+      const ant = Math.max(0, (g - 0.5 * holeDia) * thickness);
+      const agv = Math.max(0, ((rows - 1) * s + e) * thickness);
+      const agt = Math.max(0, g * thickness);
+
+      const bs1 = (0.9 * fu_calc * ant / gammaM2) + (fy_calc * agv / (gammaM0 * Math.sqrt(3)));
+      const bs2 = (fy_calc * agt / gammaM0) + (0.9 * fu_calc * anv / (gammaM2 * Math.sqrt(3)));
+      
+      ec_blockShear = Math.min(bs1, bs2) / 1000;
     }
 
     let ec_final = Math.min(ec_yield, ec_rupture);
@@ -167,6 +174,9 @@ export default function App() {
         blockShear: is_blockShear,
         final: is_final,
         mode: is_mode,
+        sigma_at,
+        alloyName,
+        isFyConflict
       },
       eurocode: {
         yield: ec_yield,
@@ -255,6 +265,16 @@ export default function App() {
                     <option>Welded</option>
                   </select>
                 </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-neutral-500 uppercase">Alloy</label>
+                  <select name="alloy" value={inputs.alloy} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all">
+                    <option>Generic/Unspecified</option>
+                    <option>HE30-WP (6061-T6)</option>
+                    <option>HE20-WP (6082-T6)</option>
+                    <option>HE9-WP (6063-T6)</option>
+                    <option>HE15-WP (2014-T6)</option>
+                  </select>
+                </div>
 
                 {/* Dimensional Inputs */}
                 <div className="space-y-1">
@@ -269,16 +289,20 @@ export default function App() {
                 {inputs.connection === 'Bolted' && (
                   <>
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-500 uppercase">Bolt Dia (mm)</label>
+                      <label className="text-xs font-semibold text-neutral-500 uppercase">Bolt Dia d (mm)</label>
                       <input type="number" name="dia" value={inputs.dia} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-500 uppercase">Hole Dia (mm)</label>
-                      <input type="number" name="holeDia" value={inputs.holeDia} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
+                      <label className="text-xs font-semibold text-neutral-500 uppercase">Hole Dia dh (mm)</label>
+                      <input type="number" name="holeDia" value={inputs.holeDia} readOnly className="w-full px-3 py-2 bg-neutral-200 border border-neutral-300 rounded-lg text-neutral-500 outline-none cursor-not-allowed" />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-500 uppercase">No. of Holes</label>
+                      <label className="text-xs font-semibold text-neutral-500 uppercase">Bolts in Cross-Section (n)</label>
                       <input type="number" name="noOfHoles" value={inputs.noOfHoles} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-semibold text-neutral-500 uppercase">Bolts in Line of Force (rows)</label>
+                      <input type="number" name="rows" value={inputs.rows} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
                     </div>
                     <div className="space-y-1">
                       <label className="text-xs font-semibold text-neutral-500 uppercase">Pitch s (mm)</label>
@@ -287,6 +311,10 @@ export default function App() {
                     <div className="space-y-1">
                       <label className="text-xs font-semibold text-neutral-500 uppercase">Gauge g (mm)</label>
                       <input type="number" name="g" value={inputs.g} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-semibold text-neutral-500 uppercase">Edge Dist e (mm)</label>
+                      <input type="number" name="e" value={inputs.e} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
                     </div>
                   </>
                 )}
@@ -311,13 +339,13 @@ export default function App() {
                       <label className="text-xs font-bold text-emerald-800 uppercase flex items-center gap-1">
                         Gross Area (Ag) mm² <Info className="w-3 h-3" />
                       </label>
-                      <input type="number" name="ag" value={inputs.ag} onChange={handleInputChange} className="w-full px-3 py-2 bg-white border-2 border-emerald-300 rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none transition-all font-mono text-lg text-emerald-900" />
+                      <input type="number" name="ag" value={inputs.ag} readOnly className="w-full px-3 py-2 bg-emerald-100 border-2 border-emerald-300 rounded-lg text-emerald-900 outline-none font-mono text-lg cursor-not-allowed" />
                     </div>
                     <div className="space-y-1">
                       <label className="text-xs font-bold text-emerald-800 uppercase flex items-center gap-1">
                         Net Area (An) mm² <Info className="w-3 h-3" />
                       </label>
-                      <input type="number" name="an" value={inputs.an} onChange={handleInputChange} className="w-full px-3 py-2 bg-white border-2 border-emerald-300 rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none transition-all font-mono text-lg text-emerald-900" />
+                      <input type="number" name="an" value={inputs.an} readOnly className="w-full px-3 py-2 bg-emerald-100 border-2 border-emerald-300 rounded-lg text-emerald-900 outline-none font-mono text-lg cursor-not-allowed" />
                     </div>
                   </div>
                 </div>
@@ -442,6 +470,12 @@ export default function App() {
                 </span>
               </div>
               <div className="p-6 space-y-4">
+                {results.is8147.isFyConflict && (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-2 text-amber-800 text-sm mb-4">
+                    <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    <p>Using IS 8147 Table 4 value for <strong>{results.is8147.alloyName}</strong> (σat = {results.is8147.sigma_at} MPa) instead of 0.6 × fy.</p>
+                  </div>
+                )}
                 <ResultRow label="Yield Strength" value={results.is8147.yield} unit="kN" />
                 <ResultRow label="Rupture Strength" value={results.is8147.rupture} unit="kN" />
                 <ResultRow 
