@@ -38,8 +38,9 @@ export function calculateConnectionCapacities(inputs: any) {
     beta = n_line >= 3 ? 0.70 : (n_line === 2 ? 0.65 : 1.0);
   }
   
-  // Rupture (N_u,Rd): (0.9 * Anet * fu * beta) / gammaM2
-  const ecRupture = (0.9 * An * fu_eff * beta) / gammaM2 / 1000;
+  // Rupture (N_u,Rd): (Aeff * fu) / gammaM2
+  const Aeff = An * beta;
+  const ecRupture = (Aeff * fu_eff) / gammaM2 / 1000;
   
   // Block Shear (V_eff,Rd): (fu * Ant / gammaM2) + (fy * Anv / (sqrt(3) * gammaM1))
   // Constraint: Do NOT apply beta to Block Shear. Use uniform tension distribution factor (u_bs = 1.0).
@@ -72,7 +73,7 @@ export function calculateConnectionCapacities(inputs: any) {
   return {
     eurocode: { yield: ecYield, rupture: ecRupture, blockShear: ecBlockShear, final: ecFinal, mode: ecMode, bsPath: 'Standard' },
     is8147: { yield: isYield, rupture: isRupture, blockShear: isBlockShear, final: isFinal, mode: isMode, bsPath: 'Standard' },
-    derived: { holeDia: dh, ag: Ag, an: An, beta, aeff: An * beta, criticalAnPath: 'Standard', rupturePaths: [] },
+    derived: { holeDia: dh, ag: Ag, an: An, beta, aeff: Aeff, criticalAnPath: 'Standard', rupturePaths: [] },
     bsPathsList: [{
       id: 'Standard',
       description: 'Standard block shear',
