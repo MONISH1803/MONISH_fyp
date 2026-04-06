@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Calculator, AlertCircle, Info, ChevronDown, ChevronUp, BookOpen, LineChart as LineChartIcon, Sliders, Presentation } from 'lucide-react';
+import { Calculator, AlertCircle, Info, ChevronDown, ChevronUp, BookOpen, LineChart as LineChartIcon, Sliders, Presentation, GitCompare } from 'lucide-react';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ComposedChart, ReferenceLine, Area } from 'recharts';
 import { EUROCODE_ALLOYS, IS8147_ALLOYS } from './data/alloys';
 import AlloyMappingPage from './pages/AlloyMappingPage';
@@ -407,27 +407,37 @@ export function TensionMemberCalculator() {
           </div>
           <a
             href="#/alloy-mapping"
-            className="inline-flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-800 hover:underline shrink-0"
+            className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 shrink-0"
           >
-            Alloy mapping (IS 8147 ↔ Eurocode)
+            <GitCompare className="w-4 h-4" />
+            Alloy mapping
           </a>
         </header>
 
-        <div className="flex space-x-1 bg-neutral-200/50 p-1 rounded-xl w-fit">
-          <button 
-            onClick={() => setActiveTab('calculator')} 
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === 'calculator' ? 'bg-white text-indigo-700 shadow-sm' : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200'}`}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex space-x-1 bg-neutral-200/50 p-1 rounded-xl w-fit">
+            <button 
+              onClick={() => setActiveTab('calculator')} 
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === 'calculator' ? 'bg-white text-indigo-700 shadow-sm' : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200'}`}
+            >
+              <Calculator className="w-4 h-4" />
+              Calculator
+            </button>
+            <button 
+              onClick={() => setActiveTab('parametric')} 
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === 'parametric' ? 'bg-white text-indigo-700 shadow-sm' : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200'}`}
+            >
+              <LineChartIcon className="w-4 h-4" />
+              Parametric Analysis
+            </button>
+          </div>
+          <a
+            href="#/alloy-mapping"
+            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium border-2 border-indigo-200 bg-indigo-50 text-indigo-800 hover:bg-indigo-100"
           >
-            <Calculator className="w-4 h-4" />
-            Calculator
-          </button>
-          <button 
-            onClick={() => setActiveTab('parametric')} 
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === 'parametric' ? 'bg-white text-indigo-700 shadow-sm' : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-200'}`}
-          >
-            <LineChartIcon className="w-4 h-4" />
-            Parametric Analysis
-          </button>
+            <GitCompare className="w-4 h-4" />
+            Open alloy mapping page
+          </a>
         </div>
 
         {activeTab === 'calculator' && (
@@ -1232,10 +1242,16 @@ export function TensionMemberCalculator() {
   );
 }
 
+function pathFromHash(): string {
+  if (typeof window === 'undefined') return '/';
+  const raw = window.location.hash.replace(/^#\/?/, '').split('?')[0].replace(/\/+$/, '');
+  return raw || '/';
+}
+
 function useHashRoute() {
-  const [route, setRoute] = useState(() => (typeof window !== 'undefined' ? window.location.hash.replace(/^#\/?/, '') || '/' : '/'));
+  const [route, setRoute] = useState(pathFromHash);
   useEffect(() => {
-    const onHash = () => setRoute(window.location.hash.replace(/^#\/?/, '') || '/');
+    const onHash = () => setRoute(pathFromHash());
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
