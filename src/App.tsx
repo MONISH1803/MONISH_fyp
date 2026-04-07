@@ -31,7 +31,7 @@ function getConnectedLegWidth(inputs: any): number {
  * Single source of truth for Eurocode shear-lag β used in Aeff = β × An.
  * - Plate (bolted): concentric/symmetric load path → x = 0 → β = 1 (no reduction). Eccentricity x > 0 → β = max(0, min(1 − x/L, 1)). Not tied to angle “connected leg” logic.
  * - Double angle (bolted): symmetric → β = 1.
- * - Single angle (bolted): β = max(0, min(1 − x/L, 1)); x = 0 → β = 1.
+ * - Single angle (bolted): β = max(0, min(1 − x/L, 1)); x = 0 → β = 1. Default UI eccentricity for angles is non-zero so shear lag varies like before; plate defaults x = 0.
  */
 /** IS 8147 Aeff caption next to numeric value (section-aware, no plate/double-angle mix-up). */
 function is8147AeffCaption(
@@ -79,6 +79,12 @@ export function getBeta(
     return 1.0;
   }
   return Math.min(1, Math.max(0, 1 - xv / Lv));
+}
+
+/** Eurocode Aeff uses β; optional UI toggle forces β = 1 without changing underlying x/L model. */
+function effectiveEurocodeBeta(inputs: { showShearLagEffect?: boolean }, betaModel: number): number {
+  if (inputs.showShearLagEffect === false) return 1.0;
+  return betaModel;
 }
 
 /** Straight transverse row: enforce b ≥ 2e + (n−1)g with effective e, g (IS-style detailing minima). */
@@ -441,15 +447,16 @@ export function calculateConnectionCapacities(inputs: any) {
     Avg *= 2;
   }
 
-  // Eurocode shear lag factor β — must match UI/graphs via getBeta().
-  const beta = getBeta(inputs.sectionType, Number(inputs.x), Number(inputs.L), connection);
+  // Eurocode shear lag factor β — model from getBeta(); UI can force β = 1 (shear lag off).
+  const betaModel = getBeta(inputs.sectionType, Number(inputs.x), Number(inputs.L), connection);
+  const beta = effectiveEurocodeBeta(inputs, betaModel);
   // #region agent log
   agentDebugLog({
     runId: 'pre-fix',
     hypothesisId: 'H3',
     location: 'App.tsx:calculateConnectionCapacities:beta',
     message: 'eurocode beta evaluation',
-    data: { sectionType: inputs.sectionType, x: inputs.x, L: inputs.L, beta },
+    data: { sectionType: inputs.sectionType, x: inputs.x, L: inputs.L, betaModel, beta },
   });
   // #endregion
 
@@ -569,6 +576,7 @@ export function calculateConnectionCapacities(inputs: any) {
       ag: Ag,
       an: An,
       beta,
+      betaModel,
       aeff: Aeff,
       isK,
       isAeff,
@@ -623,6 +631,7 @@ export function TensionMemberCalculator() {
     holePattern: 'Straight',
     stagger_p: 50,
     stagger_g: 50,
+    showShearLagEffect: true,
   });
 
   const [derived, setDerived] = useState({
@@ -630,6 +639,7 @@ export function TensionMemberCalculator() {
     ag: 1000,
     an: 820,
     beta: 1.0,
+    betaModel: 1.0,
     aeff: 820,
     isK: 1.0,
     isAeff: 820,
@@ -661,8 +671,12 @@ export function TensionMemberCalculator() {
       }
       const newInputs = { ...prev, [name]: parsedValue };
 
-      if (name === 'sectionType' && parsedValue === 'Plate') {
-        newInputs.x = 0;
+      if (name === 'sectionType') {
+        if (parsedValue === 'Plate') {
+          newInputs.x = 0;
+        } else if (parsedValue === 'Single Angle') {
+          newInputs.x = 20;
+        }
       }
 
       if (name === 'fy' && newInputs.foMode === 'Auto') {
@@ -735,6 +749,8 @@ export function TensionMemberCalculator() {
         s: 50,
         g: 50,
         e: 30,
+        x: 20,
+        L: 100,
         stagger_p: 50,
         stagger_g: 50,
       };
@@ -768,7 +784,8 @@ export function TensionMemberCalculator() {
 
   useEffect(() => {
     if (inputs.connection === 'Bolted' && boltGeometry.invalid) {
-      const betaInvalid = getBeta(inputs.sectionType, Number(inputs.x), Number(inputs.L), inputs.connection);
+      const betaModelInv = getBeta(inputs.sectionType, Number(inputs.x), Number(inputs.L), inputs.connection);
+      const betaInvalid = effectiveEurocodeBeta(inputs, betaModelInv);
       setDerived((prev) => ({
         ...prev,
         holeDia: boltGeometry.dh,
@@ -776,6 +793,7 @@ export function TensionMemberCalculator() {
         an: 0,
         aeff: 0,
         isAeff: 0,
+        betaModel: betaModelInv,
         beta: betaInvalid,
         criticalAnPath: 'Geometry Invalid',
         rupturePaths: [],
@@ -829,6 +847,82 @@ export function TensionMemberCalculator() {
 
   const isDoubleAngleBolted = inputs.sectionType === 'Double Angle' && inputs.connection === 'Bolted';
   const isPlateBolted = inputs.sectionType === 'Plate' && inputs.connection === 'Bolted';
+  const fuEffEurocode = useMemo(() => {
+    let fu_eff = Number(inputs.fu);
+    if (inputs.connection === 'Welded' && inputs.considerHAZ) {
+      fu_eff *= Number(inputs.rho_u ?? inputs.rho ?? 1);
+    }
+    return fu_eff;
+  }, [inputs.fu, inputs.connection, inputs.considerHAZ, inputs.rho_u, inputs.rho]);
+
+  const shearLagRuptureGraphData = useMemo(() => {
+    const L_GRAPH = 100;
+    const An = Number(derived.an);
+    const gammaM2 = Number(inputs.gammaM2);
+    if (!Number.isFinite(An) || An <= 0 || !Number.isFinite(fuEffEurocode) || gammaM2 <= 0) {
+      return [] as Array<{ ratio: number; ruptureNoSl: number; ruptureSl: number; xMm: number }>;
+    }
+    const rows: Array<{ ratio: number; ruptureNoSl: number; ruptureSl: number; xMm: number }> = [];
+    const ruptureNoSl = (An * fuEffEurocode) / gammaM2 / 1000;
+    for (let xMm = 0; xMm <= 50.0001; xMm += 2.5) {
+      const x = Number(xMm.toFixed(2));
+      const ratio = x / L_GRAPH;
+      const b = getBeta(inputs.sectionType, x, L_GRAPH, inputs.connection);
+      const ruptureSl = (An * b * fuEffEurocode) / gammaM2 / 1000;
+      rows.push({
+        ratio: Number(ratio.toFixed(4)),
+        ruptureNoSl: Number(ruptureNoSl.toFixed(4)),
+        ruptureSl: Number(ruptureSl.toFixed(4)),
+        xMm: x,
+      });
+    }
+    return rows;
+  }, [derived.an, inputs.sectionType, inputs.connection, inputs.gammaM2, fuEffEurocode]);
+
+  /** Current x mapped onto the fixed L-graph (100 mm) with x ∈ [0, 50] mm for the rupture chart. */
+  const shearLagRuptureCurrentPoint = useMemo(() => {
+    const Lg = 100;
+    const xClamped = Math.max(0, Math.min(50, Number(inputs.x)));
+    const ratio = xClamped / Lg;
+    const b = getBeta(inputs.sectionType, xClamped, Lg, inputs.connection);
+    const An = Number(derived.an);
+    const gammaM2 = Number(inputs.gammaM2);
+    if (!Number.isFinite(An) || An <= 0 || !Number.isFinite(fuEffEurocode) || gammaM2 <= 0) {
+      return null;
+    }
+    const ruptureSl = (An * b * fuEffEurocode) / gammaM2 / 1000;
+    return { ratio: Number(ratio.toFixed(4)), ruptureSl: Number(ruptureSl.toFixed(4)) };
+  }, [inputs.x, inputs.sectionType, inputs.connection, derived.an, inputs.gammaM2, fuEffEurocode]);
+
+  const liveShearLagFormula = useMemo(() => {
+    if (inputs.connection !== 'Bolted') {
+      return { title: 'Welded', line: 'β = 1.0 (no bolted shear lag model applied here)' };
+    }
+    if (inputs.sectionType === 'Double Angle') {
+      return { title: 'Double angle', line: 'β = 1.0 (symmetric connection)' };
+    }
+    const xv = Number(inputs.x);
+    const Lv = Number(inputs.L);
+    if (inputs.sectionType === 'Single Angle') {
+      return {
+        title: 'Single angle',
+        line:
+          Lv > 0
+            ? `β = 1 − x/L = 1 − ${xv.toFixed(2)}/${Lv.toFixed(2)} = ${derived.betaModel.toFixed(3)}`
+            : `β = 1 − x/L  →  β = ${derived.betaModel.toFixed(3)}`,
+      };
+    }
+    if (inputs.sectionType === 'Plate') {
+      if (Math.abs(xv) < 1e-9 || Lv <= 0) {
+        return { title: 'Plate', line: 'β = 1.0 when x = 0 (concentric); enter x > 0 for β = max(0, 1 − x/L)' };
+      }
+      return {
+        title: 'Plate',
+        line: `β = max(0, 1 − x/L) = max(0, 1 − ${xv.toFixed(2)}/${Lv.toFixed(2)}) = ${derived.betaModel.toFixed(3)}`,
+      };
+    }
+    return { title: 'Section', line: `β = max(0, min(1 − x/L, 1)) = ${derived.betaModel.toFixed(3)}` };
+  }, [inputs.connection, inputs.sectionType, inputs.x, inputs.L, derived.betaModel]);
 
   const generateParametricData = () => {
     const data = [];
@@ -1541,12 +1635,40 @@ export function TensionMemberCalculator() {
             <div className="bg-white rounded-2xl shadow-sm border border-neutral-200 overflow-hidden">
               <div className="bg-neutral-50 px-6 py-4 border-b border-neutral-200">
                 <h2 className="text-lg font-semibold">Eurocode Shear Lag Factor (β)</h2>
+                <p className="text-xs text-neutral-500 mt-1">Shear lag effect depends on eccentricity (x/L ratio)</p>
               </div>
               <div className="p-6 space-y-4">
+                {inputs.connection === 'Bolted' && (
+                  <label className="flex items-center gap-2 cursor-pointer rounded-lg border border-indigo-200 bg-indigo-50/60 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      name="showShearLagEffect"
+                      checked={inputs.showShearLagEffect}
+                      onChange={handleInputChange}
+                      className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+                    />
+                    <span className="text-sm font-medium text-indigo-900">Show shear lag effect</span>
+                    <span className="text-xs text-indigo-600">(OFF → β = 1 applied; ON → use formula below)</span>
+                  </label>
+                )}
+
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-1">
-                    <label className="text-xs font-semibold text-neutral-500 uppercase">Eccentricity x (mm)</label>
-                    <input type="number" name="x" value={inputs.x} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg outline-none" />
+                    <label
+                      className="text-xs font-semibold text-neutral-500 uppercase flex items-center gap-1"
+                      title="Distance between centroid and connection line"
+                    >
+                      Eccentricity x (mm)
+                      <Info className="w-3.5 h-3.5 text-neutral-400" aria-hidden />
+                    </label>
+                    <input
+                      type="number"
+                      name="x"
+                      value={inputs.x}
+                      onChange={handleInputChange}
+                      title="Distance between centroid and connection line"
+                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg outline-none"
+                    />
                   </div>
                   <div className="space-y-1">
                     <label className="text-xs font-semibold text-neutral-500 uppercase">Connection Length L (mm)</label>
@@ -1554,24 +1676,39 @@ export function TensionMemberCalculator() {
                   </div>
                 </div>
 
-                <div className="space-y-1 pt-4 border-t border-neutral-100">
-                  <label className="text-xs font-bold text-indigo-800 uppercase flex justify-between">
-                    <span>Final Beta (β)</span>
-                    {derived.beta === 1.0 && <span className="text-amber-600 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> Shear lag ignored</span>}
+                {inputs.connection === 'Bolted' && (
+                  <div className="rounded-lg border border-indigo-100 bg-white px-3 py-2 space-y-1">
+                    <p className="text-[10px] font-semibold uppercase text-indigo-600">Live formula</p>
+                    <p className="text-sm font-mono text-indigo-900 leading-snug">{liveShearLagFormula.line}</p>
+                    {inputs.sectionType === 'Single Angle' && (
+                      <p className="text-[11px] text-indigo-700">Single angle (bolted): β = 1 − x/L (values capped at β ≥ 0).</p>
+                    )}
+                  </div>
+                )}
+
+                <div className="space-y-1 pt-2 border-t border-neutral-100">
+                  <label className="text-xs font-bold text-indigo-800 uppercase flex justify-between items-center gap-2 flex-wrap">
+                    <span>β applied to Aeff (Eurocode)</span>
+                    {!inputs.showShearLagEffect && inputs.connection === 'Bolted' ? (
+                      <span className="text-amber-700 flex items-center gap-1 text-[10px] font-semibold normal-case">
+                        <AlertCircle className="w-3 h-3" /> Shear lag effect OFF (β = 1)
+                      </span>
+                    ) : derived.beta >= 0.999 && inputs.connection === 'Bolted' ? (
+                      <span className="text-amber-600 flex items-center gap-1 text-[10px] font-semibold normal-case">
+                        <AlertCircle className="w-3 h-3" /> No reduction (β ≈ 1)
+                      </span>
+                    ) : null}
                   </label>
                   <input type="number" value={derived.beta.toFixed(3)} readOnly className="w-full px-3 py-2 bg-indigo-50 border-2 border-indigo-200 rounded-lg font-mono text-lg text-indigo-900 outline-none cursor-not-allowed" />
-                  <div className="grid grid-cols-2 gap-3 mt-2">
-                    <div className="text-xs text-indigo-800"><span className="font-semibold">x/L:</span> {inputs.L > 0 ? (Number(inputs.x) / Number(inputs.L)).toFixed(3) : '0.000'}</div>
-                    <div className="text-xs text-indigo-800">
-                      <span className="font-semibold">Model:</span>{' '}
-                      {isDoubleAngleBolted
-                        ? 'β = 1.0 (symmetric double angle)'
-                        : isPlateBolted
-                          ? 'Plate: β = 1 if x = 0 (concentric); else β = max(0, min(1 − x/L, 1))'
-                          : 'β = max(0, min(1 − x/L, 1))'}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2 text-xs text-indigo-800">
+                    <div>
+                      <span className="font-semibold">Model β (from x/L):</span> {derived.betaModel.toFixed(3)}
+                    </div>
+                    <div>
+                      <span className="font-semibold">x/L:</span> {inputs.L > 0 ? (Number(inputs.x) / Number(inputs.L)).toFixed(3) : '0.000'}
                     </div>
                   </div>
-                  <p className="text-[10px] text-indigo-700 mt-1">
+                  <p className="text-[10px] text-indigo-700 mt-2">
                     {isDoubleAngleBolted ? (
                       <>Symmetric double-angle bolted connection: β is fixed at 1.0 (no shear lag reduction using x/L).</>
                     ) : isPlateBolted ? (
@@ -1605,7 +1742,13 @@ export function TensionMemberCalculator() {
                 )}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <label className="text-xs font-semibold text-neutral-600 uppercase">Eccentricity x (mm): {Number(inputs.x).toFixed(1)}</label>
+                    <label
+                      className="text-xs font-semibold text-neutral-600 uppercase flex items-center gap-1"
+                      title="Distance between centroid and connection line"
+                    >
+                      Eccentricity x (mm): {Number(inputs.x).toFixed(1)}
+                      <Info className="w-3.5 h-3.5 text-neutral-400" aria-hidden />
+                    </label>
                     <input
                       type="range"
                       min={0}
@@ -1613,6 +1756,7 @@ export function TensionMemberCalculator() {
                       step={1}
                       value={inputs.x}
                       disabled={isDoubleAngleBolted}
+                      title="Distance between centroid and connection line"
                       onChange={(e) => setInputs((prev) => ({ ...prev, x: Number(e.target.value) }))}
                       className={`w-full ${isDoubleAngleBolted ? 'opacity-50 cursor-not-allowed' : ''}`}
                     />
@@ -1715,6 +1859,82 @@ export function TensionMemberCalculator() {
                       ? 'For plates, use x = 0 for a concentric connection (β = 1). Shear lag reduction applies only when you enter eccentricity x for an offset load path.'
                       : 'Beta decreases as eccentricity increases due to shear lag.'}
                 </p>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-2xl shadow-sm border border-neutral-200 overflow-hidden">
+              <div className="bg-neutral-50 px-6 py-4 border-b border-neutral-200">
+                <h2 className="text-lg font-semibold">Effect of Shear Lag on Tension Capacity</h2>
+                <p className="text-xs text-neutral-500 mt-1">
+                  Eurocode rupture Nu,Rd = (fu × β × An) / γM2 — other inputs fixed; x varies 0–50 mm with L = 100 mm for this chart.
+                </p>
+              </div>
+              <div className="p-6 space-y-4">
+                {shearLagRuptureGraphData.length === 0 ? (
+                  <p className="text-sm text-neutral-600">Enter valid geometry and net area An to plot rupture vs x/L.</p>
+                ) : (
+                  <>
+                    <div className="h-72 w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={shearLagRuptureGraphData} margin={{ top: 12, right: 20, left: 8, bottom: 28 }}>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                          <XAxis
+                            dataKey="ratio"
+                            type="number"
+                            domain={[0, 0.5]}
+                            tickFormatter={(v) => v.toFixed(2)}
+                            label={{ value: 'Eccentricity ratio x/L (L = 100 mm, x = 0…50 mm)', position: 'insideBottom', offset: -4 }}
+                            tick={{ fill: '#6b7280' }}
+                          />
+                          <YAxis
+                            label={{ value: 'Rupture strength Nu,Rd (kN)', angle: -90, position: 'insideLeft' }}
+                            tick={{ fill: '#6b7280' }}
+                          />
+                          <Tooltip
+                            formatter={(value: number, name: string) => [`${Number(value).toFixed(3)} kN`, name]}
+                            labelFormatter={(label) => `x/L = ${Number(label).toFixed(3)}`}
+                          />
+                          <Legend />
+                          <Line
+                            type="monotone"
+                            dataKey="ruptureNoSl"
+                            stroke="#94a3b8"
+                            strokeWidth={2}
+                            dot={false}
+                            name="Without shear lag (β = 1)"
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="ruptureSl"
+                            stroke="#4f46e5"
+                            strokeWidth={3}
+                            dot={false}
+                            name="With shear lag (β from model, e.g. β = 1 − x/L for single angle)"
+                          />
+                          {shearLagRuptureCurrentPoint && (
+                            <ReferenceDot
+                              x={shearLagRuptureCurrentPoint.ratio}
+                              y={shearLagRuptureCurrentPoint.ruptureSl}
+                              r={6}
+                              fill="#dc2626"
+                              stroke="#ffffff"
+                              strokeWidth={2}
+                              label={{
+                                value: `Current (x=${Math.min(50, Math.max(0, Number(inputs.x))).toFixed(0)} mm)`,
+                                position: 'top',
+                                fill: '#991b1b',
+                                fontSize: 11,
+                              }}
+                            />
+                          )}
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <p className="text-sm text-neutral-800 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                      <span className="font-semibold">Observation:</span> As eccentricity increases, effective strength reduces (with-shear-lag curve vs horizontal β = 1).
+                    </p>
+                  </>
+                )}
               </div>
             </div>
 
@@ -1859,6 +2079,31 @@ export function TensionMemberCalculator() {
                 <span className="text-xs font-medium bg-indigo-500 text-indigo-100 px-2 py-1 rounded-full">Limit State</span>
               </div>
               <div className="p-6 space-y-4">
+                {inputs.connection === 'Bolted' && (
+                  <div className="rounded-xl border-2 border-indigo-200 bg-gradient-to-br from-indigo-50 to-white px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-indigo-700">Shear lag factor β</p>
+                      <p className="text-3xl font-mono font-bold text-indigo-950 tabular-nums">{derived.beta.toFixed(3)}</p>
+                      {!inputs.showShearLagEffect && (
+                        <p className="text-[11px] text-amber-800 mt-1">
+                          Effect OFF — β applied = 1.0 (model β = {derived.betaModel.toFixed(3)})
+                        </p>
+                      )}
+                    </div>
+                    <div className="text-xs text-indigo-800 font-mono text-right">
+                      <div>
+                        Aeff = β × An = {derived.beta.toFixed(3)} × {derived.an.toFixed(2)}
+                      </div>
+                      <div className="text-[11px] text-indigo-600 mt-1">Nu,Rd uses this Aeff for rupture</div>
+                    </div>
+                  </div>
+                )}
+                {inputs.connection === 'Bolted' && inputs.showShearLagEffect && derived.beta < 0.999 && (
+                  <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    Shear lag reduces effective strength.
+                  </p>
+                )}
                 <ResultRow label="Yield Strength (Npl,Rd)" value={results.eurocode.yield} unit="kN" isMin={nearEqual(results.eurocode.yield, results.eurocode.final)} />
                 <ResultRow label="Rupture Strength (Nu,Rd)" value={results.eurocode.rupture} unit="kN" isMin={nearEqual(results.eurocode.rupture, results.eurocode.final)} />
                 <ResultRow label="Block Shear" value={results.eurocode.blockShear} unit="kN" isMin={results.eurocode.blockShear > 0 && nearEqual(results.eurocode.blockShear, results.eurocode.final)} fallback="N/A" muted={results.eurocode.blockShear === 0} />
