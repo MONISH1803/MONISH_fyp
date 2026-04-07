@@ -29,8 +29,9 @@ function getConnectedLegWidth(inputs: any): number {
 
 /**
  * Single source of truth for Eurocode shear-lag β used in Aeff = β × An.
- * Symmetric double-angle bolted connections: β = 1 (no 1 − x/L reduction).
- * Other bolted sections: β = max(0, min(1 − x/L, 1)); x = 0 → β = 1.
+ * - Plate (bolted): concentric/symmetric load path → x = 0 → β = 1 (no reduction). Eccentricity x > 0 → β = max(0, min(1 − x/L, 1)). Not tied to angle “connected leg” logic.
+ * - Double angle (bolted): symmetric → β = 1.
+ * - Single angle (bolted): β = max(0, min(1 − x/L, 1)); x = 0 → β = 1.
  */
 /** IS 8147 Aeff caption next to numeric value (section-aware, no plate/double-angle mix-up). */
 function is8147AeffCaption(
@@ -60,6 +61,16 @@ export function getBeta(
   const Lv = Number(L);
   if (!Number.isFinite(xv) || !Number.isFinite(Lv)) {
     return 1.0;
+  }
+  // Plate: shear lag only when there is eccentricity along the member (x ≠ 0); concentric → β = 1, Aeff = An.
+  if (sectionType === 'Plate') {
+    if (Math.abs(xv) < 1e-9) {
+      return 1.0;
+    }
+    if (Lv <= 0) {
+      return 1.0;
+    }
+    return Math.min(1, Math.max(0, 1 - xv / Lv));
   }
   if (Math.abs(xv) < 1e-9) {
     return 1.0;
@@ -591,7 +602,7 @@ export function TensionMemberCalculator() {
     s: 50,
     g: 50,
     e: 30,
-    x: 20,
+    x: 0,
     L: 100,
     fy: 250,
     fu: 290,
@@ -649,6 +660,10 @@ export function TensionMemberCalculator() {
         parsedValue = ['id', 'sectionType', 'connection', 'holePattern', 'eurocodeAlloy', 'is8147Alloy', 'sigmaAtMode', 'foMode', 'connectedLeg'].includes(name) ? value : Number(value);
       }
       const newInputs = { ...prev, [name]: parsedValue };
+
+      if (name === 'sectionType' && parsedValue === 'Plate') {
+        newInputs.x = 0;
+      }
 
       if (name === 'fy' && newInputs.foMode === 'Auto') {
         newInputs.fo = Number(parsedValue);
@@ -813,7 +828,7 @@ export function TensionMemberCalculator() {
   }, [inputs.sectionType, inputs.connection]);
 
   const isDoubleAngleBolted = inputs.sectionType === 'Double Angle' && inputs.connection === 'Bolted';
-
+  const isPlateBolted = inputs.sectionType === 'Plate' && inputs.connection === 'Bolted';
 
   const generateParametricData = () => {
     const data = [];
@@ -1411,7 +1426,12 @@ export function TensionMemberCalculator() {
                             <div><span className="font-semibold">Stagger g:</span> {inputs.stagger_g} mm</div>
                           </>
                         )}
-                        <div><span className="font-semibold">Connected leg:</span> {inputs.connectedLeg}</div>
+                        {(inputs.sectionType === 'Single Angle' || inputs.sectionType === 'Double Angle') && (
+                          <div><span className="font-semibold">Connected leg:</span> {inputs.connectedLeg}</div>
+                        )}
+                        {inputs.sectionType === 'Plate' && (
+                          <div><span className="font-semibold">Plate width b:</span> {inputs.width} mm (rupture path; not leg-based)</div>
+                        )}
                         <div><span className="font-semibold">β (EC after An):</span> {derived.beta.toFixed(3)}</div>
                       </div>
 
@@ -1546,12 +1566,18 @@ export function TensionMemberCalculator() {
                       <span className="font-semibold">Model:</span>{' '}
                       {isDoubleAngleBolted
                         ? 'β = 1.0 (symmetric double angle)'
-                        : 'β = max(0, min(1 − x/L, 1))'}
+                        : isPlateBolted
+                          ? 'Plate: β = 1 if x = 0 (concentric); else β = max(0, min(1 − x/L, 1))'
+                          : 'β = max(0, min(1 − x/L, 1))'}
                     </div>
                   </div>
                   <p className="text-[10px] text-indigo-700 mt-1">
                     {isDoubleAngleBolted ? (
                       <>Symmetric double-angle bolted connection: β is fixed at 1.0 (no shear lag reduction using x/L).</>
+                    ) : isPlateBolted ? (
+                      <>
+                        Plate: shear lag applies only with eccentricity x along the member. Concentric/symmetric (x = 0) → β = 1, Aeff = An. Not based on angle leg logic.
+                      </>
                     ) : inputs.connection === 'Bolted' ? (
                       <>Eurocode shear lag: β = max(0, 1 − x/L), capped at β ≤ 1. At x = 0, β = 1.</>
                     ) : (
@@ -1624,7 +1650,9 @@ export function TensionMemberCalculator() {
                 )}
                 {inputs.connection === 'Bolted' && !isDoubleAngleBolted && Number(inputs.x) === 0 && (
                   <p className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
-                    Eccentricity x = 0: β = 1 (no shear lag).
+                    {isPlateBolted
+                      ? 'Concentric plate (x = 0): β = 1, Aeff = An. Enter x > 0 for an eccentric load path and shear lag reduction.'
+                      : 'Eccentricity x = 0: β = 1 (no shear lag).'}
                   </p>
                 )}
                 {inputs.connection === 'Bolted' && !isDoubleAngleBolted && currentXOverL > 0.5 && derived.beta < 0.95 && (
@@ -1655,7 +1683,9 @@ export function TensionMemberCalculator() {
                         stroke="#4f46e5"
                         strokeWidth={3}
                         dot={false}
-                        name={isDoubleAngleBolted ? 'β = 1 (double angle)' : 'β = 1 − x/L'}
+                        name={
+                          isDoubleAngleBolted ? 'β = 1 (double angle)' : isPlateBolted ? 'β (plate, eccentric path)' : 'β = 1 − x/L'
+                        }
                       />
                       <ReferenceDot
                         x={Math.max(0, Math.min(1, currentXOverL))}
@@ -1671,13 +1701,19 @@ export function TensionMemberCalculator() {
                 </div>
 
                 <p className="text-xs text-neutral-600 font-mono bg-neutral-50 border border-neutral-200 rounded-lg px-3 py-2">
-                  {isDoubleAngleBolted ? 'β = 1.0 (symmetric double angle)' : 'β = max(0, min(1 − x/L, 1))'}
+                  {isDoubleAngleBolted
+                    ? 'β = 1.0 (symmetric double angle)'
+                    : isPlateBolted
+                      ? 'Plate: β = max(0, min(1 − x/L, 1)) when x > 0; x = 0 → β = 1'
+                      : 'β = max(0, min(1 − x/L, 1))'}
                 </p>
 
                 <p className="text-sm text-neutral-700">
                   {isDoubleAngleBolted
                     ? 'Symmetric double-angle connections use β = 1.0 (horizontal line on chart).'
-                    : 'Beta decreases as eccentricity increases due to shear lag.'}
+                    : isPlateBolted
+                      ? 'For plates, use x = 0 for a concentric connection (β = 1). Shear lag reduction applies only when you enter eccentricity x for an offset load path.'
+                      : 'Beta decreases as eccentricity increases due to shear lag.'}
                 </p>
               </div>
             </div>
