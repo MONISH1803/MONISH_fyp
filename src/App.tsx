@@ -1,17 +1,88 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Calculator, AlertCircle, Info, ChevronDown, ChevronUp, BookOpen, LineChart as LineChartIcon, Sliders, Presentation, GitCompare } from 'lucide-react';
+import { Calculator, AlertCircle, Info, ChevronDown, ChevronUp, BookOpen, LineChart as LineChartIcon, Sliders, Presentation, GitCompare, Sparkles } from 'lucide-react';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ComposedChart, ReferenceLine, Area } from 'recharts';
 import { EUROCODE_ALLOYS, IS8147_ALLOYS } from './data/alloys';
 import AlloyMappingPage from './pages/AlloyMappingPage';
+
+function clampPositive(v: number): number {
+  return Number.isFinite(v) ? Math.max(0, v) : 0;
+}
+
+function getConnectedLegWidth(inputs: any): number {
+  const connectedLeg = inputs.connectedLeg === 'Leg 2' ? 'Leg 2' : 'Leg 1';
+  return connectedLeg === 'Leg 2' ? Number(inputs.leg2) : Number(inputs.leg1);
+}
+
+// Sample check for staggered rupture math (requested validation case):
+// b=100, t=10, dh=18, n=2, p=25, g=50
+// Straight bn=64 -> An=640 ; Zig-zag bn=67.125 -> An=671.25 ; governing = Straight.
+function buildRupturePaths(inputs: any, bPath: number, dh: number) {
+  const t = Number(inputs.thickness);
+  const n = Number(inputs.noOfHoles);
+  const staggerEnabled = inputs.connection === 'Bolted' && inputs.holePattern === 'Staggered';
+  const sp = Number(inputs.stagger_p);
+  const sg = Number(inputs.stagger_g);
+  const hasStagger = staggerEnabled && sp > 0 && sg > 0;
+  const nLine = Number(inputs.rows);
+
+  const paths: any[] = [];
+  const straightBn = clampPositive(bPath - n * dh);
+  paths.push({
+    id: 'R1',
+    type: 'Straight',
+    formula: 'bn = b - n*dh',
+    holeDeductionTerm: n * dh,
+    staggerAdditionTerm: 0,
+    bn: straightBn,
+    an: straightBn * t,
+    transitions: 0,
+  });
+
+  if (hasStagger) {
+    const staggerTerm = (sp * sp) / (4 * sg);
+    const zigBn = clampPositive(bPath - n * dh + staggerTerm);
+    paths.push({
+      id: 'R2',
+      type: 'Single zig-zag',
+      formula: 'bn = b - n*dh + p^2/(4g)',
+      holeDeductionTerm: n * dh,
+      staggerAdditionTerm: staggerTerm,
+      bn: zigBn,
+      an: zigBn * t,
+      transitions: 1,
+    });
+
+    const multiTransitions = Math.max(0, nLine - 1);
+    if (multiTransitions >= 2) {
+      const multiStaggerTerm = multiTransitions * staggerTerm;
+      const multiBn = clampPositive(bPath - n * dh + multiStaggerTerm);
+      paths.push({
+        id: 'R3',
+        type: 'Multi zig-zag',
+        formula: 'bn = b - n*dh + Σ(p_i^2/(4g_i))',
+        holeDeductionTerm: n * dh,
+        staggerAdditionTerm: multiStaggerTerm,
+        bn: multiBn,
+        an: multiBn * t,
+        transitions: multiTransitions,
+      });
+    }
+  }
+
+  const governing = paths.reduce((min, p) => (p.an < min.an ? p : min), paths[0]);
+  return {
+    paths: paths.map((p) => ({ ...p, governing: p.id === governing.id })),
+    governing,
+  };
+}
 
 // Calculation Logic strictly adhering to EN 1999-1-1 and IS 8147:1976
 export function calculateConnectionCapacities(inputs: any) {
   const {
     width, thickness, dia, noOfHoles: n, rows: n_line,
-    g, s: p, e, fy, fu, gammaM0, gammaM1, gammaM2,
-    sigmaAtIS, tau_a, connection, considerHAZ, rho_o, rho_u
+    g, s: p, e, fy, fu, gammaM0, gammaM2,
+    sigmaAtIS, connection, considerHAZ, rho_o, rho_u
   } = inputs;
-  // IS 8147 working-stress capacities use Table 4 σ_at only — never fyIS8147/fuIS8147.
   const sigma_at = sigmaAtIS == null ? 0 : Number(sigmaAtIS);
   const sigma_at_rupture = sigma_at;
 
@@ -22,123 +93,151 @@ export function calculateConnectionCapacities(inputs: any) {
     fu_eff = fu * (rho_u !== undefined ? rho_u : inputs.rho);
   }
 
-  // 1. Geometric Variables & Area Logic
-  const dh = dia + 2; // Hole Diameter: Bolt Diameter + 2mm
-  
+  const dh = dia + 2;
+  const connectedLegWidth = getConnectedLegWidth(inputs);
+
   let Ag = 0;
-  let An = 0;
-  
+  let bPath = width;
   if (inputs.sectionType === 'Plate') {
     Ag = width * thickness;
-    An = connection === 'Welded' ? Ag : (width - (n * dh)) * thickness;
+    bPath = width;
   } else if (inputs.sectionType === 'Single Angle') {
     Ag = (inputs.leg1 + inputs.leg2 - thickness) * thickness;
-    An = connection === 'Welded' ? Ag : Ag - (n * dh * thickness);
+    bPath = connectedLegWidth; // Single-angle rupture path MUST use connected leg only.
   } else if (inputs.sectionType === 'Double Angle') {
     Ag = 2 * (inputs.leg1 + inputs.leg2 - thickness) * thickness;
-    An = connection === 'Welded' ? Ag : Ag - (n * dh * 2 * thickness);
+    bPath = 2 * connectedLegWidth;
   }
-  
-  // Net Tension Area for Block Shear (Ant): (Gauge - dh) * Thickness
+
+  const ruptureEval = connection === 'Bolted'
+    ? buildRupturePaths(inputs, bPath, dh)
+    : {
+        paths: [{ id: 'R0', type: 'Welded/No hole deduction', formula: 'bn = b', holeDeductionTerm: 0, staggerAdditionTerm: 0, bn: bPath, an: bPath * thickness, governing: true }],
+        governing: { id: 'R0', an: bPath * thickness, bn: bPath },
+      };
+  const An = clampPositive(ruptureEval.governing.an);
+
+  // Block shear base areas.
   let Ant = connection === 'Welded' ? 0 : (g - dh) * thickness;
   let Atg = connection === 'Welded' ? 0 : g * thickness;
-  if (inputs.sectionType === 'Double Angle') {
-    Ant *= 2;
-    Atg *= 2;
-  }
-  
-  // Net Shear Area for Block Shear (Anv): 2 * (Edge + Pitch * (n_line - 1) - (n_line - 0.5) * dh) * Thickness
   let Anv = connection === 'Welded' ? 0 : 2 * (e + p * (n_line - 1) - (n_line - 0.5) * dh) * thickness;
   let Avg = connection === 'Welded' ? 0 : 2 * (e + p * (n_line - 1)) * thickness;
   if (inputs.sectionType === 'Double Angle') {
+    Ant *= 2;
+    Atg *= 2;
     Anv *= 2;
     Avg *= 2;
   }
 
-  // 2. Eurocode 9 (EN 1999-1-1) Implementation
-  // Yielding (N_pl,Rd): (Ag * fy) / gammaM0
-  const ecYield = (Ag * fy_eff) / gammaM0 / 1000;
-  
-  // Constraint: Apply beta (Shear Lag) ONLY to Rupture.
-  // EN 1999-1-1 Clause 6.2.3 (2) b - only applies to unsymmetrically connected members like Single Angles
   let beta = 1.0;
   if (connection === 'Bolted' && inputs.sectionType === 'Single Angle') {
-    // User-requested mapping for bolt rows in line of force:
-    // 1 bolt: 0.40, 2 bolts: 0.65, 3+ bolts: 0.70
     beta = n_line >= 3 ? 0.70 : (n_line === 2 ? 0.65 : 0.40);
   }
-  
-  // Rupture (N_u,Rd): (Aeff × fu) / gammaM2
+
+  const ecYield = (Ag * fy_eff) / gammaM0 / 1000;
   const Aeff = An * beta;
   const ecRupture = (Aeff * fu_eff) / gammaM2 / 1000;
-  
-  // Block Shear (V_eff,Rd): (fu * Ant / gammaM2) + (fy * Anv / (sqrt(3) * gammaM0))
-  // Constraint: Do NOT apply beta to Block Shear. Use uniform tension distribution factor (u_bs = 1.0).
-  let ecBlockShear = 0;
-  if (connection === 'Bolted' && n_line > 0 && p > 0) {
-    ecBlockShear = ((fu_eff * Ant) / gammaM2 + (fy_eff * Anv) / (Math.sqrt(3) * gammaM0)) / 1000;
-  }
 
-  // 3. IS 8147:1976 (Working Stress) Implementation
-  // Yielding: Ag * sigma_at
-  const isYield = (Ag * sigma_at) / 1000;
-  
-  // Rupture: Aeff * sigma_at_rupture
   let isAeff = An;
   let isK = 1.0;
   if (connection === 'Bolted') {
     if (inputs.sectionType === 'Single Angle') {
-      const a1 = (inputs.leg1 - thickness / 2) * thickness - (n * dh * thickness);
-      const a2 = (inputs.leg2 - thickness / 2) * thickness;
-      // IS 800 Cl. 6.3.3 bolt-count rules (user-requested):
-      // 1 bolt: kt=0.4, 2 bolts: kt=0.5, 3+ bolts: formula
+      const otherLeg = inputs.connectedLeg === 'Leg 2' ? Number(inputs.leg1) : Number(inputs.leg2);
+      const a1 = An;
+      const a2 = clampPositive((otherLeg - thickness / 2) * thickness);
       if (n <= 1) isK = 0.4;
       else if (n === 2) isK = 0.5;
-      else isK = (3 * a1) / (3 * a1 + a2);
+      else isK = (3 * a1) / Math.max(1e-9, (3 * a1 + a2));
       isAeff = a1 + a2 * isK;
     } else if (inputs.sectionType === 'Double Angle') {
-      const a1 = 2 * ((inputs.leg1 - thickness / 2) * thickness - (n * dh * thickness));
-      const a2 = 2 * (inputs.leg2 - thickness / 2) * thickness;
-      // IS 800 Cl. 6.3.3 bolt-count rules for double-angle:
-      // 1 bolt: kt=0.5, 2 bolts: kt=0.6, 3+ bolts: formula
+      const otherLeg = inputs.connectedLeg === 'Leg 2' ? Number(inputs.leg1) : Number(inputs.leg2);
+      const a1 = 2 * An;
+      const a2 = 2 * clampPositive((otherLeg - thickness / 2) * thickness);
       if (n <= 1) isK = 0.5;
       else if (n === 2) isK = 0.6;
-      else isK = (5 * a1) / (5 * a1 + a2);
+      else isK = (5 * a1) / Math.max(1e-9, (5 * a1 + a2));
       isAeff = a1 + a2 * isK;
     }
   }
+  const isYield = (Ag * sigma_at) / 1000;
   const isRupture = (isAeff * sigma_at_rupture) / 1000;
-  
-  // Block Shear: IS 800:2007 Clause 6.4.1 implementation (since IS 8147 doesn't specify)
-  // Use IS 8147 permissible stresses only (do NOT depend on Eurocode fy/fu selection).
-  // Tdb1 = (Avg * sigma_at) / √3 + 0.9 * Ant * sigma_at_rupture
-  // Tdb2 = 0.9 * Anv * sigma_at_rupture / √3 + Atg * sigma_at
-  let isBlockShear = 0;
-  let isTdb1 = 0;
-  let isTdb2 = 0;
+
+  const bsPathsList: any[] = [];
   if (connection === 'Bolted' && n_line > 0 && p > 0) {
-    isTdb1 = ((Avg * sigma_at) / Math.sqrt(3) + (0.9 * Ant * sigma_at_rupture)) / 1000;
-    isTdb2 = ((0.9 * Anv * sigma_at_rupture) / Math.sqrt(3) + (Atg * sigma_at)) / 1000;
-    isBlockShear = Math.min(isTdb1, isTdb2);
+    const staggerEnabled = inputs.holePattern === 'Staggered' && Number(inputs.stagger_p) > 0 && Number(inputs.stagger_g) > 0;
+    const staggerAddTerm = staggerEnabled ? (Number(inputs.stagger_p) ** 2) / (4 * Number(inputs.stagger_g)) : 0;
+    const staggerAddArea = staggerAddTerm * thickness * (inputs.sectionType === 'Double Angle' ? 2 : 1);
+
+    const candidates = [
+      {
+        id: 'B1',
+        type: 'Standard',
+        description: 'Standard block path (no stagger correction on tension plane)',
+        Avg,
+        Avn: Anv,
+        Atg,
+        Atn: Ant,
+      },
+    ];
+    if (staggerEnabled) {
+      candidates.push({
+        id: 'B2',
+        type: 'Stagger-sensitive',
+        description: 'Alternative block path with stagger correction on tension plane',
+        Avg,
+        Avn: Anv,
+        Atg,
+        Atn: clampPositive(Ant + staggerAddArea),
+      });
+    }
+
+    for (const c of candidates) {
+      const ec_bs = ((fu_eff * c.Atn) / gammaM2 + (fy_eff * c.Avn) / (Math.sqrt(3) * gammaM0)) / 1000;
+      const is_tdb1 = ((c.Avg * sigma_at) / Math.sqrt(3) + (0.9 * c.Atn * sigma_at_rupture)) / 1000;
+      const is_tdb2 = ((0.9 * c.Avn * sigma_at_rupture) / Math.sqrt(3) + (c.Atg * sigma_at)) / 1000;
+      const is_bs = Math.min(is_tdb1, is_tdb2);
+      bsPathsList.push({ ...c, ec_bs, is_bs, is_tdb1, is_tdb2, isGovEc: false, isGovIs: false });
+    }
   }
 
-  // 4. Output Requirements
-  const ecFinal = ecBlockShear > 0 ? Math.min(ecYield, ecRupture, ecBlockShear) : Math.min(ecYield, ecRupture);
-  let ecMode = ecFinal === ecYield ? 'Yielding' : (ecFinal === ecRupture ? 'Rupture' : 'Block Shear');
+  let ecBlockShear = 0;
+  let isBlockShear = 0;
+  let ecBsPath = 'N/A';
+  let isBsPath = 'N/A';
+  if (bsPathsList.length > 0) {
+    const ecGov = bsPathsList.reduce((min, pth) => (pth.ec_bs < min.ec_bs ? pth : min), bsPathsList[0]);
+    const isGov = bsPathsList.reduce((min, pth) => (pth.is_bs < min.is_bs ? pth : min), bsPathsList[0]);
+    ecBlockShear = ecGov.ec_bs;
+    isBlockShear = isGov.is_bs;
+    ecBsPath = ecGov.id;
+    isBsPath = isGov.id;
+    bsPathsList.forEach((pRow) => {
+      pRow.isGovEc = pRow.id === ecGov.id;
+      pRow.isGovIs = pRow.id === isGov.id;
+    });
+  }
 
+  const ecFinal = ecBlockShear > 0 ? Math.min(ecYield, ecRupture, ecBlockShear) : Math.min(ecYield, ecRupture);
+  const ecMode = ecFinal === ecYield ? 'Yielding' : (ecFinal === ecRupture ? 'Rupture' : 'Block Shear');
   const isFinal = isBlockShear > 0 ? Math.min(isYield, isRupture, isBlockShear) : Math.min(isYield, isRupture);
-  let isMode = isFinal === isYield ? 'Yielding' : (isFinal === isRupture ? 'Rupture' : 'Block Shear');
+  const isMode = isFinal === isYield ? 'Yielding' : (isFinal === isRupture ? 'Rupture' : 'Block Shear');
 
   return {
-    eurocode: { yield: ecYield, rupture: ecRupture, blockShear: ecBlockShear, final: ecFinal, mode: ecMode, bsPath: 'Standard' },
-    is8147: { yield: isYield, rupture: isRupture, blockShear: isBlockShear, final: isFinal, mode: isMode, bsPath: 'Standard' },
-    derived: { holeDia: dh, ag: Ag, an: An, beta, aeff: Aeff, isK, isAeff, criticalAnPath: 'Standard', rupturePaths: [] },
-    bsPathsList: [{
-      id: 'Standard',
-      description: 'Standard block shear',
-      is_bs: isBlockShear,
-      ec_bs: ecBlockShear
-    }]
+    eurocode: { yield: ecYield, rupture: ecRupture, blockShear: ecBlockShear, final: ecFinal, mode: ecMode, bsPath: ecBsPath },
+    is8147: { yield: isYield, rupture: isRupture, blockShear: isBlockShear, final: isFinal, mode: isMode, bsPath: isBsPath },
+    derived: {
+      holeDia: dh,
+      ag: Ag,
+      an: An,
+      beta,
+      aeff: Aeff,
+      isK,
+      isAeff,
+      criticalAnPath: ruptureEval.governing.id,
+      rupturePaths: ruptureEval.paths,
+      connectedLegWidth: bPath,
+    },
+    bsPathsList,
   };
 }
 
@@ -155,6 +254,7 @@ export function TensionMemberCalculator() {
     width: 100,
     leg1: 100,
     leg2: 100,
+    connectedLeg: 'Leg 1',
     thickness: 10,
     dia: 16,
     noOfHoles: 2,
@@ -195,6 +295,7 @@ export function TensionMemberCalculator() {
     aeff: 820,
     isK: 1.0,
     isAeff: 820,
+    connectedLegWidth: 100,
     criticalAnPath: 'Straight',
     rupturePaths: [] as any[],
   });
@@ -218,7 +319,7 @@ export function TensionMemberCalculator() {
         const raw = (e.target as HTMLInputElement).value;
         parsedValue = raw === '' || raw === '-' ? null : Number(raw);
       } else {
-        parsedValue = ['id', 'sectionType', 'connection', 'holePattern', 'eurocodeAlloy', 'is8147Alloy', 'betaMode', 'sigmaAtMode', 'foMode'].includes(name) ? value : Number(value);
+        parsedValue = ['id', 'sectionType', 'connection', 'holePattern', 'eurocodeAlloy', 'is8147Alloy', 'betaMode', 'sigmaAtMode', 'foMode', 'connectedLeg'].includes(name) ? value : Number(value);
       }
       const newInputs = { ...prev, [name]: parsedValue };
 
@@ -273,6 +374,54 @@ export function TensionMemberCalculator() {
     });
   };
 
+  /** Prof. demo: sample stagger case — b=100, t=10, dh=18, n=2, p=25, g=50 → governing straight path An=640 mm² */
+  const applySampleStaggerPreset = () => {
+    setInputs((prev) => {
+      const next: typeof prev = {
+        ...prev,
+        id: 'demo-stagger',
+        sectionType: 'Single Angle',
+        connection: 'Bolted',
+        holePattern: 'Staggered',
+        leg1: 100,
+        leg2: 100,
+        connectedLeg: 'Leg 1',
+        thickness: 10,
+        dia: 16,
+        noOfHoles: 2,
+        rows: 2,
+        s: 50,
+        g: 50,
+        e: 30,
+        stagger_p: 25,
+        stagger_g: 50,
+      };
+      const ecAlloyData =
+        EUROCODE_ALLOYS.find((a) => a.name === next.eurocodeAlloy) ||
+        EUROCODE_ALLOYS.find((a) => a.id === 'Generic/Unspecified');
+      if (ecAlloyData) {
+        const ecProps = ecAlloyData.getProps(next.thickness, next.sectionType);
+        next.fy = ecProps.fo;
+        next.fu = ecProps.fu;
+        next.rho_o = ecProps.rho_o;
+        next.rho_u = ecProps.rho_u;
+        if (next.foMode === 'Auto') next.fo = next.fy;
+      }
+      const isAlloyData =
+        IS8147_ALLOYS.find((a) => a.name === next.is8147Alloy) ||
+        IS8147_ALLOYS.find((a) => a.id === 'Generic/Unspecified');
+      if (isAlloyData) {
+        const mat = isAlloyData.getMaterialProps(next.thickness, next.sectionType);
+        next.fyIS8147 = mat.fy;
+        next.fuIS8147 = mat.fu;
+        if (next.sigmaAtMode === 'Auto') {
+          next.sigmaAtIS = isAlloyData.getPermissibleTable4(next.thickness, next.sectionType);
+        }
+      }
+      return next;
+    });
+  };
+
   useEffect(() => {
     const results = calculateConnectionCapacities(inputs);
     setDerived(results.derived as any);
@@ -298,23 +447,15 @@ export function TensionMemberCalculator() {
   const generateParametricData = () => {
     const data = [];
     let minVal, maxVal, steps;
-
-    if (paramVar === 'noOfHoles') {
-      minVal = Math.max(1, inputs.noOfHoles - 5);
-      maxVal = inputs.noOfHoles + 5;
-      steps = maxVal - minVal;
-    } else {
-      const baseVal = inputs[paramVar];
-      minVal = baseVal * 0.5; // -50%
-      maxVal = baseVal * 1.5; // +50%
-      steps = 20;
-    }
+    const baseVal = inputs[paramVar];
+    minVal = baseVal * 0.5; // -50%
+    maxVal = baseVal * 1.5; // +50%
+    steps = 20;
 
     const stepSize = (maxVal - minVal) / steps;
 
     for (let i = 0; i <= steps; i++) {
-      let val = minVal + i * stepSize;
-      if (paramVar === 'noOfHoles') val = Math.round(val);
+      const val = minVal + i * stepSize;
 
       const testInputs = { ...inputs, [paramVar]: val };
 
@@ -344,13 +485,11 @@ export function TensionMemberCalculator() {
       const ec = Number(results.eurocode.final.toFixed(2));
       const isv = Number(results.is8147.final.toFixed(2));
       const gap = Number((ec - isv).toFixed(2));
-      const ratioPct = isv > 0 ? Number(((ec / isv - 1) * 100).toFixed(1)) : 0;
       data.push({
-        paramValue: paramVar === 'noOfHoles' ? val : Number(val.toFixed(2)),
+        paramValue: Number(val.toFixed(2)),
         Eurocode: ec,
         IS8147: isv,
         gap,
-        ratioPct,
       });
     }
     return data;
@@ -384,10 +523,7 @@ export function TensionMemberCalculator() {
       isMin: Math.min(...isVals),
       isMax: Math.max(...isVals),
       dominance,
-      rangeLabel:
-        paramVar === 'noOfHoles'
-          ? `bolts ${parametricData[0].paramValue}–${parametricData[parametricData.length - 1].paramValue}`
-          : `about ${((parametricData[parametricData.length - 1].paramValue as number) / (parametricData[0].paramValue as number || 1)).toFixed(2)}× the starting value (±50% of current)`,
+      rangeLabel: `about ${((parametricData[parametricData.length - 1].paramValue as number) / (parametricData[0].paramValue as number || 1)).toFixed(2)}× the starting value (±50% of current)`,
     };
   }, [parametricData, paramVar]);
 
@@ -477,6 +613,19 @@ export function TensionMemberCalculator() {
                     <option>Staggered</option>
                   </select>
                 </div>
+                {inputs.connection === 'Bolted' && (
+                  <div className="md:col-span-2 lg:col-span-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={applySampleStaggerPreset}
+                      className="inline-flex items-center gap-2 rounded-lg border border-purple-300 bg-purple-50 px-3 py-2 text-xs font-semibold text-purple-900 hover:bg-purple-100"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      Load stagger demo (single angle, 100×10 mm, dh=18, n=2, p=25, g=50)
+                    </button>
+                    <span className="text-[10px] text-neutral-500">Sets inputs for the documented validation case; open Staggered Bolt Path Analysis below.</span>
+                  </div>
+                )}
                 <div className="space-y-1">
                   <label className="text-xs font-semibold text-neutral-500 uppercase">Eurocode Alloy</label>
                   <select name="eurocodeAlloy" value={inputs.eurocodeAlloy} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg outline-none">
@@ -509,6 +658,15 @@ export function TensionMemberCalculator() {
                       <label className="text-xs font-semibold text-neutral-500 uppercase">Leg 2 (mm)</label>
                       <input type="number" name="leg2" value={inputs.leg2} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg outline-none" />
                     </div>
+                    {inputs.connection === 'Bolted' && (
+                      <div className="space-y-1">
+                        <label className="text-xs font-semibold text-neutral-500 uppercase">Connected Leg for Rupture Path</label>
+                        <select name="connectedLeg" value={inputs.connectedLeg} onChange={handleInputChange} className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-lg outline-none">
+                          <option>Leg 1</option>
+                          <option>Leg 2</option>
+                        </select>
+                      </div>
+                    )}
                   </>
                 )}
                 
@@ -557,10 +715,18 @@ export function TensionMemberCalculator() {
 
                 {inputs.connection === 'Bolted' && inputs.holePattern === 'Staggered' && (
                   <div className="md:col-span-2 lg:col-span-3 p-4 bg-purple-50 border border-purple-200 rounded-xl mt-2 space-y-4">
-                    <div className="flex justify-between items-center">
+                    <div className="flex flex-wrap justify-between items-center gap-2">
                       <label className="text-xs font-bold text-purple-800 uppercase flex items-center gap-1">
                         Staggered Geometry Parameters
                       </label>
+                      <button
+                        type="button"
+                        onClick={applySampleStaggerPreset}
+                        className="inline-flex items-center gap-2 rounded-lg bg-purple-600 px-3 py-2 text-xs font-semibold text-white shadow-sm hover:bg-purple-700"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        Sample stagger case (prof. demo)
+                      </button>
                     </div>
                     
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -770,69 +936,103 @@ export function TensionMemberCalculator() {
                   </p>
                   
                   {inputs.holePattern === 'Staggered' && inputs.connection === 'Bolted' && (
-                    <div className="mt-4 p-3 bg-emerald-100/50 rounded-lg border border-emerald-200">
-                      <h4 className="text-xs font-bold text-emerald-800 uppercase mb-2">Governing Paths</h4>
-                      <div className="grid grid-cols-2 gap-4 text-sm text-emerald-900 mb-4">
-                        <div><span className="font-semibold">Rupture:</span> {derived.criticalAnPath}</div>
-                        <div><span className="font-semibold">Block Shear (EC):</span> {results.eurocode.bsPath || 'N/A'}</div>
+                    <div className="mt-4 p-3 bg-emerald-100/50 rounded-lg border border-emerald-200 space-y-4">
+                      <h4 className="text-xs font-bold text-emerald-800 uppercase">Staggered Bolt Path Analysis</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-emerald-900">
+                        <div><span className="font-semibold">b_path:</span> {derived.connectedLegWidth.toFixed(2)} mm</div>
+                        <div><span className="font-semibold">t:</span> {inputs.thickness} mm</div>
+                        <div><span className="font-semibold">dh:</span> {derived.holeDia.toFixed(2)} mm</div>
+                        <div><span className="font-semibold">n:</span> {inputs.noOfHoles}</div>
+                        <div><span className="font-semibold">p:</span> {inputs.stagger_p} mm</div>
+                        <div><span className="font-semibold">g:</span> {inputs.stagger_g} mm</div>
+                        <div><span className="font-semibold">Connected leg:</span> {inputs.connectedLeg}</div>
+                        <div><span className="font-semibold">β (EC after An):</span> {derived.beta.toFixed(3)}</div>
                       </div>
-                      
-                      <div className="space-y-4">
+
+                      <div>
+                        <h5 className="text-[11px] font-bold text-emerald-700 uppercase mb-1">Candidate Rupture Paths</h5>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-xs text-emerald-900">
+                            <thead className="bg-emerald-200/50 text-emerald-800">
+                              <tr>
+                                <th className="px-2 py-1">Path ID</th>
+                                <th className="px-2 py-1">Path Type</th>
+                                <th className="px-2 py-1">Formula</th>
+                                <th className="px-2 py-1 text-right">Hole Deduction</th>
+                                <th className="px-2 py-1 text-right">Stagger Addition</th>
+                                <th className="px-2 py-1 text-right">bn (mm)</th>
+                                <th className="px-2 py-1 text-right">An (mm²)</th>
+                                <th className="px-2 py-1 text-center">Governing?</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-emerald-200/50">
+                              {derived.rupturePaths.map((rp: any, i: number) => (
+                                <tr key={i} className={rp.governing ? 'bg-emerald-200/50 font-semibold' : ''}>
+                                  <td className="px-2 py-1">{rp.id}</td>
+                                  <td className="px-2 py-1">{rp.type}</td>
+                                  <td className="px-2 py-1 font-mono">{rp.formula}</td>
+                                  <td className="px-2 py-1 text-right">{rp.holeDeductionTerm.toFixed(3)}</td>
+                                  <td className="px-2 py-1 text-right">{rp.staggerAdditionTerm.toFixed(3)}</td>
+                                  <td className="px-2 py-1 text-right">{rp.bn.toFixed(3)}</td>
+                                  <td className="px-2 py-1 text-right">{rp.an.toFixed(3)}</td>
+                                  <td className="px-2 py-1 text-center">{rp.governing ? 'Yes' : 'No'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+
+                      <div className="text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-md p-2">
+                        <div><span className="font-semibold">Governing rupture path:</span> {derived.criticalAnPath}</div>
+                        <div><span className="font-semibold">Governing net area An:</span> {derived.an.toFixed(3)} mm²</div>
+                        <div><span className="font-semibold">IS 8147 effective area:</span> {derived.isAeff.toFixed(3)} mm²</div>
+                        <div><span className="font-semibold">Eurocode effective area:</span> {derived.aeff.toFixed(3)} mm² = β × An = {derived.beta.toFixed(3)} × {derived.an.toFixed(3)}</div>
+                        <div className="mt-1 text-emerald-700">IS 8147 stagger handling uses standard net-section path evaluation with stagger correction and governing-path selection from checked paths.</div>
+                      </div>
+
+                      {results.bsPathsList.length > 0 && (
                         <div>
-                          <h5 className="text-[11px] font-bold text-emerald-700 uppercase mb-1">Candidate Rupture Paths</h5>
+                          <h5 className="text-[11px] font-bold text-emerald-700 uppercase mb-1">Candidate Block Shear Paths</h5>
                           <div className="overflow-x-auto">
                             <table className="w-full text-left text-xs text-emerald-900">
                               <thead className="bg-emerald-200/50 text-emerald-800">
                                 <tr>
-                                  <th className="px-2 py-1 rounded-tl-md">Path</th>
-                                  <th className="px-2 py-1">Description</th>
-                                  <th className="px-2 py-1 rounded-tr-md text-right">An (mm²)</th>
+                                  <th className="px-2 py-1">Path ID</th>
+                                  <th className="px-2 py-1">Path Type</th>
+                                  <th className="px-2 py-1 text-right">Avg</th>
+                                  <th className="px-2 py-1 text-right">Avn</th>
+                                  <th className="px-2 py-1 text-right">Atg</th>
+                                  <th className="px-2 py-1 text-right">Atn</th>
+                                  <th className="px-2 py-1 text-right">IS 8147 (kN)</th>
+                                  <th className="px-2 py-1 text-right">Eurocode (kN)</th>
+                                  <th className="px-2 py-1 text-center">Gov IS?</th>
+                                  <th className="px-2 py-1 text-center">Gov EC?</th>
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-emerald-200/50">
-                                {derived.rupturePaths.map((p, i) => (
-                                  <tr key={i} className={p.id === derived.criticalAnPath ? 'bg-emerald-200/50 font-semibold' : ''}>
-                                    <td className="px-2 py-1">{p.id}</td>
-                                    <td className="px-2 py-1">{p.description}</td>
-                                    <td className="px-2 py-1 text-right">{p.an.toFixed(2)}</td>
+                                {results.bsPathsList.map((bp: any, i: number) => (
+                                  <tr key={i} className={(bp.isGovEc || bp.isGovIs) ? 'bg-emerald-200/50' : ''}>
+                                    <td className="px-2 py-1">{bp.id}</td>
+                                    <td className="px-2 py-1">{bp.type}</td>
+                                    <td className="px-2 py-1 text-right">{bp.Avg.toFixed(3)}</td>
+                                    <td className="px-2 py-1 text-right">{bp.Avn.toFixed(3)}</td>
+                                    <td className="px-2 py-1 text-right">{bp.Atg.toFixed(3)}</td>
+                                    <td className="px-2 py-1 text-right">{bp.Atn.toFixed(3)}</td>
+                                    <td className="px-2 py-1 text-right">{bp.is_bs.toFixed(3)}</td>
+                                    <td className="px-2 py-1 text-right">{bp.ec_bs.toFixed(3)}</td>
+                                    <td className="px-2 py-1 text-center">{bp.isGovIs ? 'Yes' : 'No'}</td>
+                                    <td className="px-2 py-1 text-center">{bp.isGovEc ? 'Yes' : 'No'}</td>
                                   </tr>
                                 ))}
                               </tbody>
                             </table>
                           </div>
                         </div>
+                      )}
 
-                        {results.bsPathsList.length > 0 && (
-                          <div>
-                            <h5 className="text-[11px] font-bold text-emerald-700 uppercase mb-1">Candidate Block Shear Paths</h5>
-                            <div className="overflow-x-auto">
-                              <table className="w-full text-left text-xs text-emerald-900">
-                                <thead className="bg-emerald-200/50 text-emerald-800">
-                                  <tr>
-                                    <th className="px-2 py-1 rounded-tl-md">Path</th>
-                                    <th className="px-2 py-1">Description</th>
-                                    <th className="px-2 py-1 text-right">IS 8147 (kN)</th>
-                                    <th className="px-2 py-1 rounded-tr-md text-right">Eurocode (kN)</th>
-                                  </tr>
-                                </thead>
-                                <tbody className="divide-y divide-emerald-200/50">
-                                  {results.bsPathsList.map((p, i) => (
-                                    <tr key={i} className={p.id === results.eurocode.bsPath ? 'bg-emerald-200/50 font-semibold' : ''}>
-                                      <td className="px-2 py-1">{p.id}</td>
-                                      <td className="px-2 py-1">{p.description}</td>
-                                      <td className="px-2 py-1 text-right">{p.is_bs.toFixed(2)}</td>
-                                      <td className="px-2 py-1 text-right">{p.ec_bs.toFixed(2)}</td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                      
-                      <p className="text-[10px] text-emerald-700 mt-3">
-                        * Critical zig-zag path governs net section rupture and block shear if selected.
+                      <p className="text-[11px] text-emerald-700">
+                        Under staggered bolt condition, the app checks both straight and zig-zag rupture paths. Governing path is the minimum net area path; zig-zag is not assumed to govern.
                       </p>
                     </div>
                   )}
@@ -1141,7 +1341,6 @@ export function TensionMemberCalculator() {
                     <option value="thickness">Thickness (t)</option>
                     <option value="width">Width (w)</option>
                     <option value="dia">Bolt Diameter (d)</option>
-                    <option value="noOfHoles">Number of Bolts (n)</option>
                   </select>
                 </div>
               </div>
@@ -1165,7 +1364,7 @@ export function TensionMemberCalculator() {
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
                     <XAxis 
                       dataKey="paramValue" 
-                      label={{ value: paramVar === 'thickness' ? 'Thickness (mm)' : paramVar === 'width' ? 'Width (mm)' : paramVar === 'dia' ? 'Bolt Diameter (mm)' : 'Number of Bolts', position: 'insideBottom', offset: -10 }} 
+                      label={{ value: paramVar === 'thickness' ? 'Thickness (mm)' : paramVar === 'width' ? 'Width (mm)' : 'Bolt Diameter (mm)', position: 'insideBottom', offset: -10 }} 
                       tick={{ fill: '#6b7280' }}
                       tickMargin={10}
                     />
@@ -1177,18 +1376,17 @@ export function TensionMemberCalculator() {
                       contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)' }}
                       formatter={(value, name) => {
                         if (name === 'Gap (EC - IS)') return [`${Number(value).toFixed(2)} kN`, name];
-                        if (name === 'Difference (%)') return [`${Number(value).toFixed(1)} %`, name];
                         return [`${Number(value).toFixed(2)} kN`, name];
                       }}
-                      labelFormatter={(label) => `${paramVar === 'thickness' ? 'Thickness' : paramVar === 'width' ? 'Width' : paramVar === 'dia' ? 'Diameter' : 'Bolts'}: ${label}`}
+                      labelFormatter={(label) => `${paramVar === 'thickness' ? 'Thickness' : paramVar === 'width' ? 'Width' : 'Diameter'}: ${label}`}
                       itemSorter={(item) => {
-                        const order: Record<string, number> = { 'Eurocode EN 1999': 0, 'IS 8147:1976': 1, 'Gap (EC - IS)': 2, 'Difference (%)': 3 };
+                        const order: Record<string, number> = { 'Eurocode EN 1999': 0, 'IS 8147:1976': 1, 'Gap (EC - IS)': 2 };
                         return order[item.name as string] ?? 99;
                       }}
                     />
                     <Legend verticalAlign="top" height={36} iconType="circle" />
                     <ReferenceLine
-                      x={paramVar === 'noOfHoles' ? Math.round(inputs.noOfHoles) : Number(inputs[paramVar].toFixed?.(2) ?? inputs[paramVar])}
+                      x={Number(inputs[paramVar].toFixed?.(2) ?? inputs[paramVar])}
                       stroke="#6b7280"
                       strokeDasharray="4 4"
                       label={{ value: 'Current input', position: 'insideTopRight', fill: '#4b5563', fontSize: 12 }}
@@ -1198,8 +1396,6 @@ export function TensionMemberCalculator() {
                     <Line type="monotone" dataKey="Eurocode" stroke="#4f46e5" strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} name="Eurocode EN 1999" />
                     <Line type="monotone" dataKey="IS8147" stroke="#e11d48" strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} name="IS 8147:1976" />
                     <Line type="monotone" dataKey="gap" stroke="#0f766e" strokeDasharray="6 4" strokeWidth={2} dot={false} name="Gap (EC - IS)" />
-                    <Line type="monotone" dataKey="ratioPct" stroke="#d97706" strokeDasharray="3 3" strokeWidth={2} dot={false} name="Difference (%)" yAxisId={1} />
-                    <YAxis hide yAxisId={1} domain={['auto', 'auto']} />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
@@ -1212,7 +1408,7 @@ export function TensionMemberCalculator() {
                   </h3>
                   <p className="text-sm text-indigo-800">
                     The solid lines show the governing design capacity for each code while varying one parameter around the current input. 
-                    The teal dashed line shows absolute gap (Eurocode - IS 8147), and the amber dashed line shows percentage difference. 
+                    The teal dashed line shows absolute gap (Eurocode - IS 8147). 
                     The vertical dashed marker indicates your current input value ({inputs[paramVar]}).
                     {paramVar === 'thickness' && " For thickness sweeps, alloy-dependent strengths can change with thickness limits, so local bends in the curve are expected."}
                   </p>
