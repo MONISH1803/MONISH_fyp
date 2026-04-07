@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test:rupture": "tsx src/ruptureNetSection.selfTest.ts"
+    "test:rupture": "tsx src/ruptureNetSection.selfTest.ts",
+    "test:audit": "tsx src/auditSelfTest.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

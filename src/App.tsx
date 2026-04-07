@@ -4,6 +4,7 @@ import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, L
 import { EUROCODE_ALLOYS, IS8147_ALLOYS } from './data/alloys';
 import AlloyMappingPage from './pages/AlloyMappingPage';
 import { evaluateBoltedRupturePaths, type RuptureInputs } from './ruptureNetSection';
+import { nearEqual, pickGoverningLimitState } from './governingCapacity';
 
 /** Local-only debug helper (no-op in production builds). */
 function agentDebugLog(payload: Record<string, unknown>) {
@@ -31,6 +32,18 @@ function getConnectedLegWidth(inputs: any): number {
  * Symmetric double-angle bolted connections: β = 1 (no 1 − x/L reduction).
  * Other bolted sections: β = max(0, min(1 − x/L, 1)); x = 0 → β = 1.
  */
+/** IS 8147 Aeff caption next to numeric value (section-aware, no plate/double-angle mix-up). */
+function is8147AeffCaption(
+  sectionType: string,
+  connection: string,
+  usesIsEffectiveArea: boolean
+): string {
+  if (usesIsEffectiveArea) return '(a1 + k × a2)';
+  if (sectionType === 'Double Angle' && connection === 'Bolted') return '(Aeff_IS = An, symmetric double angle)';
+  if (sectionType === 'Plate') return '(Aeff_IS = An)';
+  return '(Aeff_IS = An)';
+}
+
 export function getBeta(
   sectionType: string,
   x: number,
@@ -518,10 +531,12 @@ export function calculateConnectionCapacities(inputs: any) {
     });
   }
 
-  const ecFinal = ecBlockShear > 0 ? Math.min(ecYield, ecRupture, ecBlockShear) : Math.min(ecYield, ecRupture);
-  const ecMode = ecFinal === ecYield ? 'Yielding' : (ecFinal === ecRupture ? 'Rupture' : 'Block Shear');
-  const isFinal = isBlockShear > 0 ? Math.min(isYield, isRupture, isBlockShear) : Math.min(isYield, isRupture);
-  const isMode = isFinal === isYield ? 'Yielding' : (isFinal === isRupture ? 'Rupture' : 'Block Shear');
+  const ecGov = pickGoverningLimitState(ecYield, ecRupture, ecBlockShear);
+  const ecFinal = ecGov.final;
+  const ecMode = ecGov.mode;
+  const isGov = pickGoverningLimitState(isYield, isRupture, isBlockShear);
+  const isFinal = isGov.final;
+  const isMode = isGov.mode;
   // #region agent log
   agentDebugLog({
     runId: 'pre-fix',
@@ -738,6 +753,7 @@ export function TensionMemberCalculator() {
 
   useEffect(() => {
     if (inputs.connection === 'Bolted' && boltGeometry.invalid) {
+      const betaInvalid = getBeta(inputs.sectionType, Number(inputs.x), Number(inputs.L), inputs.connection);
       setDerived((prev) => ({
         ...prev,
         holeDia: boltGeometry.dh,
@@ -745,6 +761,7 @@ export function TensionMemberCalculator() {
         an: 0,
         aeff: 0,
         isAeff: 0,
+        beta: betaInvalid,
         criticalAnPath: 'Geometry Invalid',
         rupturePaths: [],
       }));
@@ -796,6 +813,9 @@ export function TensionMemberCalculator() {
   }, [inputs.sectionType, inputs.connection]);
 
   const effectiveAreaVsLengthData = useMemo(() => {
+    if (inputs.connection === 'Bolted' && boltGeometry.invalid) {
+      return [] as Array<{ L: number; beta: number; aeff: number }>;
+    }
     const an = Number(derived.an) || 0;
     const x = Number(inputs.x);
     const data: Array<{ L: number; beta: number; aeff: number }> = [];
@@ -808,7 +828,7 @@ export function TensionMemberCalculator() {
       });
     }
     return data;
-  }, [derived.an, inputs.x, inputs.sectionType, inputs.connection]);
+  }, [derived.an, inputs.x, inputs.sectionType, inputs.connection, boltGeometry.invalid]);
 
   const isDoubleAngleBolted = inputs.sectionType === 'Double Angle' && inputs.connection === 'Bolted';
 
@@ -826,7 +846,17 @@ export function TensionMemberCalculator() {
     for (let i = 0; i <= steps; i++) {
       const val = minVal + i * stepSize;
 
-      const testInputs = { ...inputs, [paramVar]: val };
+      const testInputs = { ...inputs } as typeof inputs;
+      if (paramVar === 'width') {
+        if (inputs.sectionType === 'Plate') {
+          testInputs.width = val;
+        } else {
+          testInputs.leg1 = val;
+          testInputs.leg2 = val;
+        }
+      } else {
+        (testInputs as any)[paramVar] = val;
+      }
 
       if (paramVar === 'thickness') {
         const ecAlloyData = EUROCODE_ALLOYS.find(a => a.name === testInputs.eurocodeAlloy) || EUROCODE_ALLOYS.find(a => a.id === 'Generic/Unspecified');
@@ -1370,7 +1400,8 @@ export function TensionMemberCalculator() {
                     </div>
                   </div>
                   <p className="text-xs text-emerald-800 mt-2">
-                    IS rupture uses <span className="font-mono">Aeff_IS</span> = <span className="font-mono">{derived.isAeff.toFixed(2)} mm²</span> {usesIsEffectiveArea ? '(a1 + k × a2)' : (inputs.sectionType === 'Double Angle' && inputs.connection === 'Bolted' ? '(Aeff_IS = An for double-angle symmetric connection)' : '(Aeff_IS = An for plate / welded case)')}.
+                    IS rupture uses <span className="font-mono">Aeff_IS</span> = <span className="font-mono">{derived.isAeff.toFixed(2)} mm²</span>{' '}
+                    {is8147AeffCaption(inputs.sectionType, inputs.connection, usesIsEffectiveArea)}.
                   </p>
                   
                   {inputs.connection === 'Bolted' && (
@@ -1439,7 +1470,12 @@ export function TensionMemberCalculator() {
                       <div className="text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-md p-2">
                         <div><span className="font-semibold">Governing rupture path:</span> {derived.criticalAnPath}</div>
                         <div><span className="font-semibold">Governing net area An:</span> {derived.an.toFixed(3)} mm²</div>
-                        <div><span className="font-semibold">IS 8147 effective area:</span> {derived.isAeff.toFixed(3)} mm² {inputs.sectionType === 'Single Angle' ? `(Aeff_IS = a1 + k*a2, k=${derived.isK.toFixed(3)})` : '(Aeff_IS = An)'}</div>
+                        <div>
+                          <span className="font-semibold">IS 8147 effective area:</span> {derived.isAeff.toFixed(3)} mm²{' '}
+                          {usesIsEffectiveArea
+                            ? `(Aeff_IS = a1 + k×a2, k=${derived.isK.toFixed(3)})`
+                            : is8147AeffCaption(inputs.sectionType, inputs.connection, false)}
+                        </div>
                         <div><span className="font-semibold">Eurocode effective area:</span> {derived.aeff.toFixed(3)} mm² = β × An = {derived.beta.toFixed(3)} × {derived.an.toFixed(3)}</div>
                         <div className="mt-1 text-emerald-700">
                           {inputs.holePattern === 'Straight'
@@ -1653,22 +1689,28 @@ export function TensionMemberCalculator() {
                 </div>
 
                 <div className="h-64 w-full">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={effectiveAreaVsLengthData} margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
-                      <XAxis dataKey="L" label={{ value: 'Connection length L (mm)', position: 'insideBottom', offset: -4 }} tick={{ fill: '#6b7280' }} />
-                      <YAxis label={{ value: 'Effective area Aeff (mm²)', angle: -90, position: 'insideLeft' }} tick={{ fill: '#6b7280' }} />
-                      <Tooltip
-                        formatter={(value: any, name: any, item: any) => {
-                          if (name === 'Aeff = β*An') return [`${Number(value).toFixed(2)} mm²`, `${name} (β=${item.payload.beta.toFixed(3)})`];
-                          return [`${Number(value).toFixed(3)}`, name];
-                        }}
-                        labelFormatter={(label) => `L = ${label} mm`}
-                      />
-                      <Legend />
-                      <Line type="monotone" dataKey="aeff" stroke="#0f766e" strokeWidth={3} dot={{ r: 3 }} name="Aeff = β*An" />
-                    </LineChart>
-                  </ResponsiveContainer>
+                  {effectiveAreaVsLengthData.length === 0 ? (
+                    <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-4 h-full flex items-center">
+                      Aeff vs L is not plotted while bolt layout validation fails or An is unavailable — resolve geometry validation first.
+                    </p>
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={effectiveAreaVsLengthData} margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                        <XAxis dataKey="L" label={{ value: 'Connection length L (mm)', position: 'insideBottom', offset: -4 }} tick={{ fill: '#6b7280' }} />
+                        <YAxis label={{ value: 'Effective area Aeff (mm²)', angle: -90, position: 'insideLeft' }} tick={{ fill: '#6b7280' }} />
+                        <Tooltip
+                          formatter={(value: any, name: any, item: any) => {
+                            if (name === 'Aeff = β*An') return [`${Number(value).toFixed(2)} mm²`, `${name} (β=${item.payload.beta.toFixed(3)})`];
+                            return [`${Number(value).toFixed(3)}`, name];
+                          }}
+                          labelFormatter={(label) => `L = ${label} mm`}
+                        />
+                        <Legend />
+                        <Line type="monotone" dataKey="aeff" stroke="#0f766e" strokeWidth={3} dot={{ r: 3 }} name="Aeff = β*An" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
                 </div>
 
                 <p className="text-sm text-neutral-700">
@@ -1700,7 +1742,10 @@ export function TensionMemberCalculator() {
                         <li className="text-xs text-neutral-600">Aeff_IS = a1 + k × a2, with k = {derived.isK.toFixed(3)}.</li>
                       )}
                       {!usesIsEffectiveArea && inputs.sectionType === 'Double Angle' && inputs.connection === 'Bolted' && (
-                        <li className="text-xs text-neutral-600">For double-angle symmetric connection, Aeff_IS = An (no k-factor).</li>
+                        <li className="text-xs text-neutral-600">Double-angle symmetric bolted: Aeff_IS = An (no k-factor).</li>
+                      )}
+                      {!usesIsEffectiveArea && inputs.sectionType === 'Plate' && (
+                        <li className="text-xs text-neutral-600">Plate: Aeff_IS = An.</li>
                       )}
                       <li className="text-blue-700">Note: σ_at is the single Table 4 permissible tensile stress.</li>
                     </ul>
@@ -1758,8 +1803,8 @@ export function TensionMemberCalculator() {
                     Table 4 permissible tensile stress σ_at is not set. Enter a value under Manual, or use Auto with a mapped alloy. IS capacities use 0 when σ_at is missing.
                   </p>
                 )}
-                <ResultRow label="Yield Strength" value={results.is8147.yield} unit="kN" isMin={results.is8147.yield === results.is8147.final} />
-                <ResultRow label="Rupture Strength" value={results.is8147.rupture} unit="kN" isMin={results.is8147.rupture === results.is8147.final} />
+                <ResultRow label="Yield Strength" value={results.is8147.yield} unit="kN" isMin={nearEqual(results.is8147.yield, results.is8147.final)} />
+                <ResultRow label="Rupture Strength" value={results.is8147.rupture} unit="kN" isMin={nearEqual(results.is8147.rupture, results.is8147.final)} />
                 <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-700 font-mono space-y-1">
                   <div className="font-semibold text-slate-800">IS 8147 Rupture Calculation</div>
                   <div>P_u = Aeff_IS × σ_at</div>
@@ -1768,7 +1813,11 @@ export function TensionMemberCalculator() {
                   <div className="font-sans text-[11px] text-slate-600">
                     {usesIsEffectiveArea
                       ? `Where Aeff_IS = a1 + a2 × k, with k = ${derived.isK.toFixed(3)}`
-                      : 'Where Aeff_IS = An'}
+                      : inputs.sectionType === 'Double Angle'
+                        ? 'Where Aeff_IS = An (symmetric double angle).'
+                        : inputs.sectionType === 'Plate'
+                          ? 'Where Aeff_IS = An (plate).'
+                          : 'Where Aeff_IS = An.'}
                   </div>
                 </div>
                 <div className="flex justify-between items-center group relative">
@@ -1781,7 +1830,7 @@ export function TensionMemberCalculator() {
                   {results.is8147.blockShear === 0 ? (
                     <span className="text-sm font-mono text-neutral-400">N/A</span>
                   ) : (
-                    <span className={`text-base font-mono font-medium ${results.is8147.blockShear === results.is8147.final ? 'text-rose-600 font-bold' : 'text-neutral-900'}`}>
+                    <span className={`text-base font-mono font-medium ${results.is8147.blockShear > 0 && nearEqual(results.is8147.blockShear, results.is8147.final) ? 'text-rose-600 font-bold' : 'text-neutral-900'}`}>
                       {results.is8147.blockShear.toFixed(2)} <span className="text-xs text-neutral-500">kN</span>
                     </span>
                   )}
@@ -1813,9 +1862,9 @@ export function TensionMemberCalculator() {
                 <span className="text-xs font-medium bg-indigo-500 text-indigo-100 px-2 py-1 rounded-full">Limit State</span>
               </div>
               <div className="p-6 space-y-4">
-                <ResultRow label="Yield Strength (Npl,Rd)" value={results.eurocode.yield} unit="kN" isMin={results.eurocode.yield === results.eurocode.final} />
-                <ResultRow label="Rupture Strength (Nu,Rd)" value={results.eurocode.rupture} unit="kN" isMin={results.eurocode.rupture === results.eurocode.final} />
-                <ResultRow label="Block Shear" value={results.eurocode.blockShear} unit="kN" isMin={results.eurocode.blockShear > 0 && results.eurocode.blockShear === results.eurocode.final} fallback="N/A" muted={results.eurocode.blockShear === 0} />
+                <ResultRow label="Yield Strength (Npl,Rd)" value={results.eurocode.yield} unit="kN" isMin={nearEqual(results.eurocode.yield, results.eurocode.final)} />
+                <ResultRow label="Rupture Strength (Nu,Rd)" value={results.eurocode.rupture} unit="kN" isMin={nearEqual(results.eurocode.rupture, results.eurocode.final)} />
+                <ResultRow label="Block Shear" value={results.eurocode.blockShear} unit="kN" isMin={results.eurocode.blockShear > 0 && nearEqual(results.eurocode.blockShear, results.eurocode.final)} fallback="N/A" muted={results.eurocode.blockShear === 0} />
                 
                 <div className="pt-4 mt-4 border-t border-neutral-200">
                   <div className="flex justify-between items-end">
@@ -1861,7 +1910,10 @@ export function TensionMemberCalculator() {
                   <span className="font-medium text-neutral-900">Rupture (N_u,Rd)</span>
                   <span className="text-neutral-500 text-xs mt-1">Clause 6.2.3 (2) b</span>
                   <span className="font-mono bg-neutral-50 p-2 rounded mt-1 border border-neutral-100">N_u,Rd = (Aeff × fu) / γM2</span>
-                  <span className="text-xs text-neutral-500 mt-1">Where Aeff = An * β (Shear lag factor β = {derived.beta})</span>
+                  <span className="text-xs text-neutral-500 mt-1">
+                    Where Aeff = An × β, with β = {derived.beta.toFixed(3)}
+                    {isDoubleAngleBolted ? ' (symmetric double angle: β = 1).' : inputs.connection === 'Bolted' ? ' (shear lag: β = max(0, min(1 − x/L, 1)) unless noted above).' : ' (welded: β = 1 here).'}
+                  </span>
                   <span className="font-mono text-xs text-indigo-700 mt-1">Substituted: ({inputs.fu.toFixed(2)} × {derived.aeff.toFixed(2)}) / {inputs.gammaM2.toFixed(2)} / 1000 = {results.eurocode.rupture.toFixed(2)} kN</span>
                 </li>
                 {inputs.connection === 'Bolted' && (
@@ -1891,7 +1943,13 @@ export function TensionMemberCalculator() {
                     </span>
                   )}
                   {!usesIsEffectiveArea && (
-                    <span className="text-xs text-neutral-500 mt-1">For this case, Aeff_IS = An.</span>
+                    <span className="text-xs text-neutral-500 mt-1">
+                      {inputs.sectionType === 'Double Angle'
+                        ? 'Where Aeff_IS = An (symmetric double angle).'
+                        : inputs.sectionType === 'Plate'
+                          ? 'Where Aeff_IS = An (plate).'
+                          : 'Where Aeff_IS = An.'}
+                    </span>
                   )}
                   <span className="font-mono text-xs text-emerald-700 mt-1">Substituted: {derived.isAeff.toFixed(2)} × {sigmaAtDisp} / 1000 = {inputs.sigmaAtIS == null ? '—' : results.is8147.rupture.toFixed(2)} kN</span>
                 </li>
@@ -1957,7 +2015,18 @@ export function TensionMemberCalculator() {
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
                     <XAxis 
                       dataKey="paramValue" 
-                      label={{ value: paramVar === 'thickness' ? 'Thickness (mm)' : paramVar === 'width' ? 'Width (mm)' : 'Bolt Diameter (mm)', position: 'insideBottom', offset: -10 }} 
+                      label={{
+                        value:
+                          paramVar === 'thickness'
+                            ? 'Thickness (mm)'
+                            : paramVar === 'width'
+                              ? inputs.sectionType === 'Plate'
+                                ? 'Width (mm)'
+                                : 'Leg length (mm, both legs)'
+                              : 'Bolt diameter (mm)',
+                        position: 'insideBottom',
+                        offset: -10,
+                      }} 
                       tick={{ fill: '#6b7280' }}
                       tickMargin={10}
                     />
