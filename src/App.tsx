@@ -550,6 +550,8 @@ export function TensionMemberCalculator() {
     });
   };
 
+  const boltGeometry = useMemo(() => evaluateBoltCrossSectionGeometry(inputs), [inputs]);
+
   useEffect(() => {
     if (inputs.connection === 'Bolted' && boltGeometry.invalid) {
       setDerived((prev) => ({
@@ -588,7 +590,6 @@ export function TensionMemberCalculator() {
   const sigmaAtDisp = inputs.sigmaAtIS == null ? '—' : inputs.sigmaAtIS.toFixed(2);
 
   const selectedEcAlloy = EUROCODE_ALLOYS.find(a => a.name === inputs.eurocodeAlloy);
-  const boltGeometry = useMemo(() => evaluateBoltCrossSectionGeometry(inputs), [inputs]);
 
   const eurocodeBetaFromXL = useMemo(() => {
     const x = Number(inputs.x);
